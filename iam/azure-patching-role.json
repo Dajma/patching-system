@@ -1,0 +1,38 @@
+{
+  "Name": "Patching System Operator",
+  "Description": "Least-privilege role for patching-system automation. Scoped to Visual Studio subscription only.",
+  "IsCustom": true,
+  "Actions": [
+    "Microsoft.Compute/virtualMachines/read",
+    "Microsoft.Compute/virtualMachines/write",
+    "Microsoft.Compute/virtualMachines/restart/action",
+    "Microsoft.Compute/virtualMachines/assessPatches/action",
+    "Microsoft.Compute/virtualMachines/installPatches/action",
+    "Microsoft.Maintenance/maintenanceConfigurations/read",
+    "Microsoft.Maintenance/maintenanceConfigurations/write",
+    "Microsoft.Maintenance/maintenanceConfigurations/delete",
+    "Microsoft.Maintenance/configurationAssignments/read",
+    "Microsoft.Maintenance/configurationAssignments/write",
+    "Microsoft.Maintenance/configurationAssignments/delete",
+    "Microsoft.Maintenance/applyUpdates/read",
+    "Microsoft.Maintenance/applyUpdates/write",
+    "Microsoft.Resources/subscriptions/resourceGroups/read",
+    "Microsoft.Resources/subscriptions/resourceGroups/write",
+    "Microsoft.Resources/subscriptions/resourceGroups/delete",
+    "Microsoft.Network/virtualNetworks/read",
+    "Microsoft.Network/publicIPAddresses/read",
+    "Microsoft.Network/networkInterfaces/read",
+    "Microsoft.Network/networkSecurityGroups/read",
+    "Microsoft.OperationalInsights/workspaces/read",
+    "Microsoft.OperationalInsights/workspaces/write",
+    "Microsoft.OperationalInsights/workspaces/sharedKeys/action",
+    "Microsoft.Insights/diagnosticSettings/read",
+    "Microsoft.Insights/diagnosticSettings/write"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/2f791c46-1726-4a0c-94e8-48314ac8f1b4"
+  ]
+}

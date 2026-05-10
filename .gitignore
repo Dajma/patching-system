@@ -1,0 +1,15 @@
+# Secrets — never commit these
+scripts/.azure-sp-credentials.env
+scripts/.vm-state.env
+*.pem
+*.key
+
+# Terraform state
+terraform/.terraform/
+terraform/**/.terraform/
+terraform/**/*.tfstate
+terraform/**/*.tfstate.backup
+terraform/**/.terraform.lock.hcl
+
+# OS
+.DS_Store
