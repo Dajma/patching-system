@@ -235,48 +235,11 @@ jobs:
           GCP_ZONE:               ${{ env.GCP_ZONE }}
         run: bash scripts/create-vms.sh
 
-      - name: Wait — AWS SSM agent registration (up to 8 min)
-        run: |
-          echo "Polling for SSM agent registration..."
-          for i in $(seq 1 24); do
-            COUNT=$(aws ssm describe-instance-information \
-              --filters "Key=tag:Project,Values=patching-system" \
-              --query 'length(InstanceInformationList)' \
-              --output text 2>/dev/null || echo "0")
-            echo "  Registered: $COUNT / 2"
-            [[ "$COUNT" -ge 2 ]] && echo "SSM agents ready." && break
-            [[ "$i" -eq 24 ]] && echo "WARNING: SSM registration timeout — continuing" && break
-            sleep 20
-          done
-
-      - name: Wait — Azure Update Manager ready (up to 5 min)
-        run: |
-          echo "Polling for Azure VM running state..."
-          for i in $(seq 1 15); do
-            RUNNING=$(az vm list \
-              --resource-group "$AZURE_RG" \
-              --show-details \
-              --query "length([?powerState=='VM running'])" \
-              --output tsv 2>/dev/null || echo "0")
-            echo "  Running: $RUNNING / 2"
-            [[ "$RUNNING" -ge 2 ]] && echo "Azure VMs ready." && break
-            [[ "$i" -eq 15 ]] && echo "WARNING: Azure VM ready timeout — continuing" && break
-            sleep 20
-          done
-
-      - name: Wait — GCP OS Config agent ready (up to 5 min)
-        run: |
-          echo "Polling for GCP OS Config inventory..."
-          for i in $(seq 1 15); do
-            COUNT=$(gcloud compute instances list \
-              --project="${{ secrets.GCP_PROJECT }}" \
-              --filter="labels.project=patching-system AND status=RUNNING" \
-              --format="value(name)" 2>/dev/null | wc -l || echo "0")
-            echo "  Running: $COUNT / 2"
-            [[ "$COUNT" -ge 2 ]] && echo "GCP VMs ready." && break
-            [[ "$i" -eq 15 ]] && echo "WARNING: GCP ready timeout — continuing" && break
-            sleep 20
-          done
+      - name: Verify cloud agents online
+        env:
+          GCP_PROJECT:            ${{ secrets.GCP_PROJECT }}
+          AZURE_SUBSCRIPTION_ID:  ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: bash scripts/verify-agents.sh
 
       - name: Upload VM state file
         uses: actions/upload-artifact@v4
