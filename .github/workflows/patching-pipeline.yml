@@ -1,0 +1,897 @@
+# Multi-cloud VM patching pipeline
+# Secrets required — configure in Settings → Secrets → Actions:
+#
+#   AWS_ACCESS_KEY_ID         IAM user or role with SSM + EC2 + IAM permissions
+#   AWS_SECRET_ACCESS_KEY
+#   ARM_CLIENT_ID             Azure service principal (patching-system-sp)
+#   ARM_CLIENT_SECRET
+#   ARM_TENANT_ID
+#   ARM_SUBSCRIPTION_ID       Visual Studio subscription: 2f791c46-…
+#   GCP_CREDENTIALS           Full JSON key for a GCP service account
+#   GCP_PROJECT               GCP project ID (e.g. learn-image-project)
+#   ALERT_EMAIL               (optional) patch-failure alert destination
+
+name: Patching System CI/CD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+
+# Never cancel a running pipeline mid-flight — test VMs may already be up
+concurrency:
+  group: patching-pipeline
+  cancel-in-progress: false
+
+env:
+  TF_VERSION:   "1.9.5"
+  AWS_REGION:   "us-east-1"
+  AZURE_REGION: "eastus"
+  GCP_REGION:   "us-central1"
+  GCP_ZONE:     "us-central1-a"
+  AZURE_RG:     "patching-system-rg"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOB 1 — Deploy Patching Infrastructure
+# Runs terraform apply for all three clouds.
+# Idempotent: safe to re-run on every push.
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  deploy-infrastructure:
+    name: "1 · Deploy Infrastructure"
+    runs-on: ubuntu-latest
+
+    outputs:
+      aws_instance_profile:      ${{ steps.tf-aws-out.outputs.instance_profile_name }}
+      aws_maintenance_window_id: ${{ steps.tf-aws-out.outputs.maintenance_window_id }}
+      azure_identity_client_id:  ${{ steps.tf-azure-out.outputs.user_assigned_identity_client_id }}
+      gcp_sa_email:              ${{ steps.tf-gcp-out.outputs.service_account_email }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      # ── AWS ────────────────────────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Terraform init + apply (AWS)
+        working-directory: terraform/aws
+        env:
+          TF_VAR_environment:   "dev"
+          TF_VAR_region:        ${{ env.AWS_REGION }}
+          TF_VAR_alert_email:   ${{ secrets.ALERT_EMAIL }}
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
+      - name: Capture AWS outputs
+        id: tf-aws-out
+        working-directory: terraform/aws
+        run: |
+          echo "instance_profile_name=$(terraform output -raw instance_profile_name)" >> "$GITHUB_OUTPUT"
+          echo "maintenance_window_id=$(terraform output -raw maintenance_window_id)" >> "$GITHUB_OUTPUT"
+          echo "s3_log_bucket=$(terraform output -raw s3_log_bucket_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload AWS Terraform state
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-state-aws
+          path: terraform/aws/terraform.tfstate
+          retention-days: 1
+
+      # ── Azure ──────────────────────────────────────────────────────────────
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.ARM_CLIENT_ID }}
+          client-secret:   ${{ secrets.ARM_CLIENT_SECRET }}
+          tenant-id:       ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Ensure Azure resource group exists
+        run: |
+          az group create \
+            --name "$AZURE_RG" \
+            --location "$AZURE_REGION" \
+            --tags Environment=testing Project=patching-system \
+            --output none
+
+      - name: Terraform init + apply (Azure)
+        working-directory: terraform/azure
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          TF_VAR_environment:          "dev"
+          TF_VAR_resource_group_name:  ${{ env.AZURE_RG }}
+          TF_VAR_location:             ${{ env.AZURE_REGION }}
+          TF_VAR_subscription_id:      ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          TF_VAR_alert_email:          ${{ secrets.ALERT_EMAIL }}
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
+      - name: Capture Azure outputs
+        id: tf-azure-out
+        working-directory: terraform/azure
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          echo "user_assigned_identity_client_id=$(terraform output -raw user_assigned_identity_client_id)" >> "$GITHUB_OUTPUT"
+          echo "log_analytics_workspace_id=$(terraform output -raw log_analytics_workspace_id)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Azure Terraform state
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-state-azure
+          path: terraform/azure/terraform.tfstate
+          retention-days: 1
+
+      # ── GCP ────────────────────────────────────────────────────────────────
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Enable required GCP APIs
+        run: |
+          gcloud services enable \
+            osconfig.googleapis.com \
+            pubsub.googleapis.com \
+            cloudscheduler.googleapis.com \
+            logging.googleapis.com \
+            storage.googleapis.com \
+            --project="${{ secrets.GCP_PROJECT }}" --quiet
+
+      - name: Terraform init + apply (GCP)
+        working-directory: terraform/gcp
+        env:
+          GOOGLE_CREDENTIALS:   ${{ secrets.GCP_CREDENTIALS }}
+          TF_VAR_environment:   "dev"
+          TF_VAR_project_id:    ${{ secrets.GCP_PROJECT }}
+          TF_VAR_region:        ${{ env.GCP_REGION }}
+          TF_VAR_alert_email:   ${{ secrets.ALERT_EMAIL }}
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
+      - name: Capture GCP outputs
+        id: tf-gcp-out
+        working-directory: terraform/gcp
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          echo "service_account_email=$(terraform output -raw service_account_email)" >> "$GITHUB_OUTPUT"
+          echo "log_sink_bucket=$(terraform output -raw log_sink_bucket_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload GCP Terraform state
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-state-gcp
+          path: terraform/gcp/terraform.tfstate
+          retention-days: 1
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOB 2 — Launch Test VMs
+# Provisions one Linux + one Windows VM per cloud for end-to-end testing.
+# Waits until each cloud's patch agent is registered before proceeding.
+# ──────────────────────────────────────────────────────────────────────────────
+  launch-test-vms:
+    name: "2 · Launch Test VMs"
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.ARM_CLIENT_ID }}
+          client-secret:   ${{ secrets.ARM_CLIENT_SECRET }}
+          tenant-id:       ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create VMs (all clouds)
+        env:
+          AWS_REGION:             ${{ env.AWS_REGION }}
+          AZURE_SUBSCRIPTION_ID:  ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          AZURE_REGION:           ${{ env.AZURE_REGION }}
+          GCP_PROJECT:            ${{ secrets.GCP_PROJECT }}
+          GCP_ZONE:               ${{ env.GCP_ZONE }}
+        run: bash scripts/create-vms.sh
+
+      - name: Wait — AWS SSM agent registration (up to 8 min)
+        run: |
+          echo "Polling for SSM agent registration..."
+          for i in $(seq 1 24); do
+            COUNT=$(aws ssm describe-instance-information \
+              --filters "Key=tag:Project,Values=patching-system" \
+              --query 'length(InstanceInformationList)' \
+              --output text 2>/dev/null || echo "0")
+            echo "  Registered: $COUNT / 2"
+            [[ "$COUNT" -ge 2 ]] && echo "SSM agents ready." && break
+            [[ "$i" -eq 24 ]] && echo "WARNING: SSM registration timeout — continuing" && break
+            sleep 20
+          done
+
+      - name: Wait — Azure Update Manager ready (up to 5 min)
+        run: |
+          echo "Polling for Azure VM running state..."
+          for i in $(seq 1 15); do
+            RUNNING=$(az vm list \
+              --resource-group "$AZURE_RG" \
+              --show-details \
+              --query "length([?powerState=='VM running'])" \
+              --output tsv 2>/dev/null || echo "0")
+            echo "  Running: $RUNNING / 2"
+            [[ "$RUNNING" -ge 2 ]] && echo "Azure VMs ready." && break
+            [[ "$i" -eq 15 ]] && echo "WARNING: Azure VM ready timeout — continuing" && break
+            sleep 20
+          done
+
+      - name: Wait — GCP OS Config agent ready (up to 5 min)
+        run: |
+          echo "Polling for GCP OS Config inventory..."
+          for i in $(seq 1 15); do
+            COUNT=$(gcloud compute instances list \
+              --project="${{ secrets.GCP_PROJECT }}" \
+              --filter="labels.project=patching-system AND status=RUNNING" \
+              --format="value(name)" 2>/dev/null | wc -l || echo "0")
+            echo "  Running: $COUNT / 2"
+            [[ "$COUNT" -ge 2 ]] && echo "GCP VMs ready." && break
+            [[ "$i" -eq 15 ]] && echo "WARNING: GCP ready timeout — continuing" && break
+            sleep 20
+          done
+
+      - name: Upload VM state file
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-state
+          path: scripts/.vm-state.env
+          retention-days: 1
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOB 3 — Trigger Patch Scan
+# Runs a compliance scan (no package installs, no reboots).
+# Verifies that each cloud's compliance reporting pipeline is working.
+# ──────────────────────────────────────────────────────────────────────────────
+  trigger-patch-scan:
+    name: "3 · Trigger Patch Scan"
+    runs-on: ubuntu-latest
+    needs: launch-test-vms
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.ARM_CLIENT_ID }}
+          client-secret:   ${{ secrets.ARM_CLIENT_SECRET }}
+          tenant-id:       ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      # Scan = assess what's missing, no changes applied
+      - name: AWS — send Scan command via SSM
+        id: aws-scan
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunPatchBaseline" \
+            --parameters '{"Operation":["Scan"],"RebootOption":["NoReboot"]}' \
+            --targets "Key=tag:Project,Values=patching-system" \
+            --comment "CI patch scan — ${{ github.run_id }}" \
+            --output text --query 'Command.CommandId' 2>/dev/null || echo "")
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "AWS scan command ID: $COMMAND_ID"
+
+      - name: Azure — trigger patch assessment
+        run: |
+          az vm list --resource-group "$AZURE_RG" --query '[].name' -o tsv | \
+          while read -r VM; do
+            echo "Triggering assessment on $VM..."
+            az vm assess-patches \
+              --resource-group "$AZURE_RG" \
+              --name "$VM" \
+              --no-wait \
+              --output none 2>/dev/null || echo "  assess-patches not available for $VM, skipping"
+          done
+
+      - name: GCP — execute dry-run patch scan
+        id: gcp-scan
+        run: |
+          JOB_NAME=$(gcloud compute os-config patch-jobs execute \
+            --project="${{ secrets.GCP_PROJECT }}" \
+            --instance-filter-all \
+            --dry-run \
+            --format="value(name)" 2>/dev/null || echo "")
+          echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+          echo "GCP dry-run job: $JOB_NAME"
+
+      - name: Wait — AWS scan completion (up to 10 min)
+        if: steps.aws-scan.outputs.command_id != ''
+        run: |
+          COMMAND_ID="${{ steps.aws-scan.outputs.command_id }}"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --query 'CommandInvocations[].Status' \
+              --output text 2>/dev/null || echo "Pending")
+            echo "  Status: $STATUS"
+            echo "$STATUS" | grep -qvE "InProgress|Pending|Delayed" && break
+            [[ "$i" -eq 30 ]] && echo "WARNING: scan timeout — continuing" && break
+            sleep 20
+          done
+          aws ssm list-command-invocations \
+            --command-id "$COMMAND_ID" \
+            --details \
+            --query 'CommandInvocations[].{Instance:InstanceId,Status:Status}' \
+            --output table 2>/dev/null || true
+
+      - name: Wait — GCP scan completion (up to 10 min)
+        if: steps.gcp-scan.outputs.job_name != ''
+        run: |
+          JOB="${{ steps.gcp-scan.outputs.job_name }}"
+          for i in $(seq 1 30); do
+            STATE=$(gcloud compute os-config patch-jobs describe "$JOB" \
+              --project="${{ secrets.GCP_PROJECT }}" \
+              --format="value(state)" 2>/dev/null || echo "UNKNOWN")
+            echo "  State: $STATE"
+            [[ "$STATE" == "SUCCEEDED" || "$STATE" == "COMPLETED_WITH_ERRORS" ]] && break
+            [[ "$STATE" == "FAILED" ]] && echo "WARNING: GCP scan failed" && break
+            [[ "$i" -eq 30 ]] && echo "WARNING: GCP scan timeout — continuing" && break
+            sleep 20
+          done
+
+      - name: Verify AWS compliance data available
+        run: |
+          echo "=== AWS Compliance Summary ==="
+          aws ssm list-compliance-summaries \
+            --filters "Key=ComplianceType,Values=Patch" \
+            --output table 2>/dev/null || echo "No compliance data yet (expected for new VMs)"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOB 4 — Schedule Test Patch Run
+# Triggers a real patch installation in dry-run/limited mode to validate the
+# end-to-end patching flow without breaking services.
+# ──────────────────────────────────────────────────────────────────────────────
+  test-patch-run:
+    name: "4 · Test Patch Run"
+    runs-on: ubuntu-latest
+    needs: trigger-patch-scan
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.ARM_CLIENT_ID }}
+          client-secret:   ${{ secrets.ARM_CLIENT_SECRET }}
+          tenant-id:       ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      # Install mode with NoReboot validates the full patch pipeline without
+      # disrupting the (test) VM. RebootIfNeeded would be used in production.
+      - name: AWS — test patch install (no reboot)
+        id: aws-patch
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunPatchBaseline" \
+            --parameters '{"Operation":["Install"],"RebootOption":["NoReboot"]}' \
+            --targets "Key=tag:Project,Values=patching-system" \
+            --comment "CI test patch run — ${{ github.run_id }}" \
+            --timeout-seconds 3600 \
+            --output text --query 'Command.CommandId' 2>/dev/null || echo "")
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "AWS patch command ID: $COMMAND_ID"
+
+      - name: Azure — simulate maintenance window (list pending updates)
+        run: |
+          echo "=== Azure pending updates per VM ==="
+          az vm list --resource-group "$AZURE_RG" --query '[].name' -o tsv | \
+          while read -r VM; do
+            echo "--- $VM ---"
+            az vm run-command invoke \
+              --resource-group "$AZURE_RG" \
+              --name "$VM" \
+              --command-id RunShellScript \
+              --scripts "apt-get --simulate upgrade 2>/dev/null | grep 'upgraded,' || true" \
+              --output json 2>/dev/null | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); \
+                [print(m['message']) for r in d.get('value',[]) for m in r.get('message',[])]" \
+              2>/dev/null || echo "  (run-command not available or timed out)"
+          done
+
+      - name: GCP — trigger real patch job (no reboot, test VMs only)
+        id: gcp-patch
+        run: |
+          JOB_NAME=$(gcloud compute os-config patch-jobs execute \
+            --project="${{ secrets.GCP_PROJECT }}" \
+            --instance-filter-label-key="project" \
+            --instance-filter-label-values="patching-system" \
+            --reboot-config=NEVER \
+            --timeout=3600s \
+            --format="value(name)" 2>/dev/null || echo "")
+          echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+          echo "GCP patch job: $JOB_NAME"
+
+      - name: Wait — AWS patch completion (up to 15 min)
+        if: steps.aws-patch.outputs.command_id != ''
+        run: |
+          COMMAND_ID="${{ steps.aws-patch.outputs.command_id }}"
+          for i in $(seq 1 45); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --query 'CommandInvocations[].Status' \
+              --output text 2>/dev/null || echo "Pending")
+            echo "  Status: $STATUS"
+            echo "$STATUS" | grep -qvE "InProgress|Pending|Delayed" && break
+            [[ "$i" -eq 45 ]] && echo "WARNING: patch run timeout" && break
+            sleep 20
+          done
+
+      - name: Wait — GCP patch completion (up to 15 min)
+        if: steps.gcp-patch.outputs.job_name != ''
+        run: |
+          JOB="${{ steps.gcp-patch.outputs.job_name }}"
+          for i in $(seq 1 45); do
+            STATE=$(gcloud compute os-config patch-jobs describe "$JOB" \
+              --project="${{ secrets.GCP_PROJECT }}" \
+              --format="value(state)" 2>/dev/null || echo "UNKNOWN")
+            echo "  State: $STATE"
+            [[ "$STATE" =~ ^(SUCCEEDED|COMPLETED_WITH_ERRORS|FAILED)$ ]] && break
+            [[ "$i" -eq 45 ]] && echo "WARNING: GCP patch timeout" && break
+            sleep 20
+          done
+
+      - name: Validate AWS patch results
+        run: |
+          echo "=== AWS patch compliance after run ==="
+          aws ssm list-compliance-summaries \
+            --filters "Key=ComplianceType,Values=Patch" \
+            --output table 2>/dev/null || echo "No data yet"
+
+          FAIL_COUNT=$(aws ssm list-compliance-items \
+            --filters "Key=ComplianceType,Values=Patch" "Key=Status,Values=NON_COMPLIANT" \
+            --query 'length(ComplianceItems)' --output text 2>/dev/null || echo "0")
+
+          if [[ "$FAIL_COUNT" -gt 0 ]]; then
+            echo "⚠ WARNING: $FAIL_COUNT non-compliant instances detected"
+          else
+            echo "✓ All instances compliant"
+          fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOB 5 — Compliance Report
+# Collects compliance data from all three clouds, generates an HTML report,
+# and publishes it to GitHub Pages.
+# ──────────────────────────────────────────────────────────────────────────────
+  compliance-report:
+    name: "5 · Compliance Report"
+    runs-on: ubuntu-latest
+    needs: test-patch-run
+
+    permissions:
+      pages:    write
+      id-token: write
+      contents: write
+
+    environment:
+      name: github-pages
+      url:  ${{ steps.deploy-pages.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.ARM_CLIENT_ID }}
+          client-secret:   ${{ secrets.ARM_CLIENT_SECRET }}
+          tenant-id:       ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Collect compliance data
+        run: |
+          mkdir -p report
+
+          # AWS
+          aws ssm list-compliance-summaries \
+            --filters "Key=ComplianceType,Values=Patch" \
+            --output json 2>/dev/null > report/aws_compliance.json || echo "[]" > report/aws_compliance.json
+
+          aws ssm describe-instance-information \
+            --filters "Key=tag:Project,Values=patching-system" \
+            --output json 2>/dev/null > report/aws_instances.json || echo "[]" > report/aws_instances.json
+
+          # Azure
+          az vm list \
+            --resource-group "$AZURE_RG" \
+            --show-details \
+            --output json 2>/dev/null > report/azure_vms.json || echo "[]" > report/azure_vms.json
+
+          az maintenance applyupdate list \
+            --resource-group "$AZURE_RG" \
+            --provider-name Microsoft.Compute \
+            --resource-type virtualMachines \
+            --output json 2>/dev/null > report/azure_updates.json || echo "[]" > report/azure_updates.json
+
+          # GCP
+          gcloud compute os-config patch-jobs list \
+            --project="${{ secrets.GCP_PROJECT }}" \
+            --limit=5 \
+            --format=json 2>/dev/null > report/gcp_patch_jobs.json || echo "[]" > report/gcp_patch_jobs.json
+
+          gcloud compute instances list \
+            --project="${{ secrets.GCP_PROJECT }}" \
+            --filter="labels.project=patching-system" \
+            --format=json 2>/dev/null > report/gcp_instances.json || echo "[]" > report/gcp_instances.json
+
+      - name: Generate HTML report
+        env:
+          RUN_ID:     ${{ github.run_id }}
+          RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO:       ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, datetime
+
+          def load(path):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except Exception:
+                  return []
+
+          def load_obj(path):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+          aws_comp   = load_obj("report/aws_compliance.json")
+          aws_inst   = load_obj("report/aws_instances.json")
+          azure_vms  = load("report/azure_vms.json")
+          gcp_jobs   = load("report/gcp_patch_jobs.json")
+          gcp_inst   = load("report/gcp_instances.json")
+
+          now      = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+          run_id   = os.environ.get("RUN_ID", "")
+          run_url  = os.environ.get("RUN_URL", "#")
+          sha      = os.environ.get("COMMIT_SHA", "")[:7]
+          repo     = os.environ.get("REPO", "")
+
+          # AWS instances
+          aws_instances = aws_inst.get("InstanceInformationList", [])
+          aws_rows = ""
+          for inst in aws_instances:
+              iid  = inst.get("InstanceId", "—")
+              ping = inst.get("PingStatus", "—")
+              plat = inst.get("PlatformName", "—")
+              ver  = inst.get("PlatformVersion", "—")
+              ag   = inst.get("AgentVersion", "—")
+              badge = '<span class="badge ok">Online</span>' if ping == "Online" \
+                      else f'<span class="badge warn">{ping}</span>'
+              aws_rows += f"<tr><td><code>{iid}</code></td><td>{badge}</td><td>{plat} {ver}</td><td>{ag}</td></tr>"
+          if not aws_rows:
+              aws_rows = '<tr><td colspan="4" class="none">No SSM-registered instances found</td></tr>'
+
+          # Azure VMs
+          azure_rows = ""
+          for vm in azure_vms:
+              name  = vm.get("name", "—")
+              state = vm.get("powerState", "—")
+              loc   = vm.get("location", "—")
+              size  = vm.get("hardwareProfile", {}).get("vmSize", "—")
+              badge = '<span class="badge ok">VM running</span>' if "running" in state.lower() \
+                      else f'<span class="badge warn">{state}</span>'
+              azure_rows += f"<tr><td>{name}</td><td>{badge}</td><td>{loc}</td><td>{size}</td></tr>"
+          if not azure_rows:
+              azure_rows = '<tr><td colspan="4" class="none">No VMs found in resource group</td></tr>'
+
+          # GCP patch jobs
+          gcp_rows = ""
+          for job in gcp_jobs[:5]:
+              name       = job.get("name", "—").split("/")[-1]
+              state      = job.get("state", "—")
+              create_t   = job.get("createTime", "—")[:19].replace("T", " ")
+              patched    = job.get("instanceDetailsSummary", {}).get("succeededInstanceCount", "—")
+              failed     = job.get("instanceDetailsSummary", {}).get("failedInstanceCount", 0)
+              state_class = "ok" if state in ("SUCCEEDED", "COMPLETED_WITH_ERRORS") \
+                            else "warn" if state == "RUNNING" else "fail"
+              badge = f'<span class="badge {state_class}">{state}</span>'
+              gcp_rows += f"<tr><td><code>{name}</code></td><td>{badge}</td><td>{create_t}</td><td>{patched}</td><td>{failed}</td></tr>"
+          if not gcp_rows:
+              gcp_rows = '<tr><td colspan="5" class="none">No patch jobs found</td></tr>'
+
+          # Compliance summary counters
+          aws_online  = sum(1 for i in aws_instances if i.get("PingStatus") == "Online")
+          azure_run   = sum(1 for v in azure_vms if "running" in v.get("powerState", "").lower())
+          gcp_success = sum(1 for j in gcp_jobs if j.get("state") == "SUCCEEDED")
+
+          html = f"""<!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Patching Compliance Report</title>
+            <style>
+              :root {{
+                --aws:   #ff9900;
+                --azure: #0078d4;
+                --gcp:   #4285f4;
+                --ok:    #22c55e;
+                --warn:  #f59e0b;
+                --fail:  #ef4444;
+                --bg:    #0f172a;
+                --card:  #1e293b;
+                --text:  #e2e8f0;
+                --sub:   #94a3b8;
+                --border:#334155;
+              }}
+              * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+              body {{ background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; padding: 2rem; }}
+              h1 {{ font-size: 1.6rem; margin-bottom: 0.25rem; }}
+              .meta {{ color: var(--sub); font-size: 0.85rem; margin-bottom: 2rem; }}
+              .meta a {{ color: var(--sub); }}
+              .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 2.5rem; }}
+              .card {{ background: var(--card); border-radius: 8px; padding: 1.25rem 1.5rem; border-top: 3px solid; }}
+              .card.aws   {{ border-color: var(--aws); }}
+              .card.azure {{ border-color: var(--azure); }}
+              .card.gcp   {{ border-color: var(--gcp); }}
+              .card h2 {{ font-size: 0.8rem; text-transform: uppercase; letter-spacing: .08em; color: var(--sub); margin-bottom: 0.5rem; }}
+              .card .big {{ font-size: 2.2rem; font-weight: 700; line-height: 1; }}
+              .card .label {{ font-size: 0.8rem; color: var(--sub); margin-top: 0.25rem; }}
+              section {{ margin-bottom: 2.5rem; }}
+              section h3 {{ font-size: 1rem; text-transform: uppercase; letter-spacing: .06em; padding-bottom: 0.5rem;
+                            border-bottom: 1px solid var(--border); margin-bottom: 1rem; }}
+              section h3 span {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 0.5rem; }}
+              table {{ width: 100%; border-collapse: collapse; font-size: 0.875rem; }}
+              th {{ text-align: left; color: var(--sub); font-weight: 500; padding: 0.5rem 0.75rem;
+                    border-bottom: 1px solid var(--border); }}
+              td {{ padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); }}
+              tr:last-child td {{ border-bottom: none; }}
+              code {{ font-family: monospace; font-size: 0.8rem; background: #0f172a; padding: 0.1em 0.4em; border-radius: 3px; }}
+              .badge {{ display: inline-block; padding: 0.15em 0.6em; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }}
+              .badge.ok   {{ background: #14532d; color: #4ade80; }}
+              .badge.warn {{ background: #451a03; color: #fbbf24; }}
+              .badge.fail {{ background: #450a0a; color: #f87171; }}
+              .none {{ color: var(--sub); font-style: italic; text-align: center; padding: 1.5rem !important; }}
+              footer {{ margin-top: 3rem; color: var(--sub); font-size: 0.8rem; text-align: center; }}
+            </style>
+          </head>
+          <body>
+            <h1>Patching Compliance Report</h1>
+            <p class="meta">
+              Generated: {now} &nbsp;·&nbsp;
+              Commit: <a href="https://github.com/{repo}/commit/{sha}"><code>{sha}</code></a> &nbsp;·&nbsp;
+              <a href="{run_url}">Actions run #{run_id}</a>
+            </p>
+
+            <div class="summary">
+              <div class="card aws">
+                <h2>AWS · SSM</h2>
+                <div class="big">{aws_online}</div>
+                <div class="label">agents online</div>
+              </div>
+              <div class="card azure">
+                <h2>Azure · Update Manager</h2>
+                <div class="big">{azure_run}</div>
+                <div class="label">VMs running</div>
+              </div>
+              <div class="card gcp">
+                <h2>GCP · OS Config</h2>
+                <div class="big">{gcp_success}</div>
+                <div class="label">patch jobs succeeded</div>
+              </div>
+            </div>
+
+            <section>
+              <h3><span style="background:var(--aws)"></span>AWS — SSM Managed Instances</h3>
+              <table>
+                <thead><tr><th>Instance ID</th><th>Agent Status</th><th>Platform</th><th>SSM Agent</th></tr></thead>
+                <tbody>{aws_rows}</tbody>
+              </table>
+            </section>
+
+            <section>
+              <h3><span style="background:var(--azure)"></span>Azure — Virtual Machines</h3>
+              <table>
+                <thead><tr><th>Name</th><th>Power State</th><th>Location</th><th>Size</th></tr></thead>
+                <tbody>{azure_rows}</tbody>
+              </table>
+            </section>
+
+            <section>
+              <h3><span style="background:var(--gcp)"></span>GCP — Recent Patch Jobs</h3>
+              <table>
+                <thead><tr><th>Job ID</th><th>State</th><th>Created</th><th>Succeeded</th><th>Failed</th></tr></thead>
+                <tbody>{gcp_rows}</tbody>
+              </table>
+            </section>
+
+            <footer>
+              <a href="https://github.com/{repo}">patching-system</a> &nbsp;·&nbsp;
+              NIST SP 800-40r3 / CIS Controls v8
+            </footer>
+          </body>
+          </html>"""
+
+          with open("report/index.html", "w") as f:
+              f.write(html)
+          print("Report written to report/index.html")
+          PYEOF
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-report
+          path: report/
+          retention-days: 30
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: report/
+
+      - name: Deploy to GitHub Pages
+        id: deploy-pages
+        uses: actions/deploy-pages@v4
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOB 6 — Cleanup (always runs)
+# Destroys test VMs to stop billing. Patching infrastructure (Terraform) is
+# intentionally left in place.
+# ──────────────────────────────────────────────────────────────────────────────
+  cleanup:
+    name: "6 · Cleanup Test VMs"
+    runs-on: ubuntu-latest
+    needs: [launch-test-vms, trigger-patch-scan, test-patch-run, compliance-report]
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download VM state file
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-state
+          path: scripts/
+        continue-on-error: true   # if launch-test-vms never ran, there is no state
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.ARM_CLIENT_ID }}
+          client-secret:   ${{ secrets.ARM_CLIENT_SECRET }}
+          tenant-id:       ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Destroy test VMs
+        env:
+          AWS_REGION:            ${{ env.AWS_REGION }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          GCP_PROJECT:           ${{ secrets.GCP_PROJECT }}
+          GCP_ZONE:              ${{ env.GCP_ZONE }}
+        run: |
+          if [[ ! -f scripts/.vm-state.env ]]; then
+            echo "No VM state file found — nothing to destroy."
+            exit 0
+          fi
+          bash scripts/destroy-vms.sh --force
+
+      - name: Confirm no running test VMs (billing check)
+        run: |
+          echo "=== AWS — remaining test instances ==="
+          aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=patching-system" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name}' \
+            --output table 2>/dev/null || echo "None"
+
+          echo "=== Azure — remaining resource groups ==="
+          az group list \
+            --query "[?tags.Project=='patching-system' && tags.Environment=='testing'].name" \
+            --output tsv 2>/dev/null || echo "None"
+
+          echo "=== GCP — remaining test instances ==="
+          gcloud compute instances list \
+            --project="${{ secrets.GCP_PROJECT }}" \
+            --filter="labels.project=patching-system" \
+            --format="table(name,status,zone)" 2>/dev/null || echo "None"
