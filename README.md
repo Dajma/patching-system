@@ -536,15 +536,68 @@ patching-system/
 │   └── gcp/
 │       └── patch-deployment.yaml      # GCP OS Config patch deployment
 │
-└── terraform/                         # (Phase 3+) Infrastructure as Code
+├── modules/                           # Reusable Terraform modules
+│   ├── aws-patching/                  # AWS SSM + IAM + S3 + EventBridge + SNS
+│   │   ├── versions.tf
+│   │   ├── variables.tf
+│   │   ├── main.tf
+│   │   └── outputs.tf
+│   ├── azure-patching/               # Azure identity + Log Analytics + maintenance + policy
+│   │   ├── versions.tf
+│   │   ├── variables.tf
+│   │   ├── main.tf
+│   │   └── outputs.tf
+│   └── gcp-patching/                 # GCP SA + OS Config + Pub/Sub + Scheduler + Logging
+│       ├── versions.tf
+│       ├── variables.tf
+│       ├── main.tf
+│       └── outputs.tf
+│
+└── terraform/                         # Root modules (call modules above, run terraform here)
     ├── aws/
+    │   ├── versions.tf                # Provider pins + backend (local)
+    │   ├── provider.tf
+    │   ├── main.tf                    # module "patching" { source = "../../modules/aws-patching" }
+    │   ├── variables.tf
+    │   ├── outputs.tf
+    │   └── terraform.tfvars.example   # Copy → terraform.tfvars before applying
     ├── azure/
+    │   ├── versions.tf
+    │   ├── provider.tf
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   ├── outputs.tf
+    │   └── terraform.tfvars.example
     └── gcp/
+        ├── versions.tf
+        ├── provider.tf
+        ├── main.tf
+        ├── variables.tf
+        ├── outputs.tf
+        └── terraform.tfvars.example
 ```
 
 ---
+## 14. Testing Strategy (Production Mindset)
 
-## 14. Quick Start
+### Pre-Patch Validation
+- Patch staging environment first (dev → qa → prod)
+- Run integration tests against patched VMs before production
+- Validate application health endpoints post-patch
+
+### Rollback Plan
+- AWS: DLM snapshot before patching; restore from snapshot
+- Azure: Azure Backup integration; restore VM
+- GCP: Pre-patch disk snapshot; detach/replace disk
+
+### Canary Deployment
+1. Patch 5% of fleet
+2. Monitor error rate, latency, CPU for 30 minutes
+3. If anomaly detected: stop, rollback, alert
+4. If healthy: patch remaining 95%
+
+---
+## 15. Quick Start
 
 ### Phase 1 — Create Test VMs
 ```bash
@@ -572,7 +625,44 @@ az maintenance applyupdate list --resource-group patching-system-rg
 gcloud compute instances os-inventory list-instances --project=$GCP_PROJECT
 ```
 
-### Phase 3 — Run a Patch Scan (no changes)
+### Phase 3 — Deploy Terraform Infrastructure
+
+Each cloud is a separate root module. Requires cloud credentials configured before running.
+
+```bash
+# AWS
+cd terraform/aws
+cp terraform.tfvars.example terraform.tfvars   # fill in region, alert_email, etc.
+terraform init
+terraform plan
+terraform apply
+
+# Azure
+cd terraform/azure
+cp terraform.tfvars.example terraform.tfvars   # fill in subscription_id, resource_group_name, location
+terraform init
+terraform plan
+terraform apply
+
+# GCP
+cd terraform/gcp
+cp terraform.tfvars.example terraform.tfvars   # fill in project_id, region
+terraform init
+terraform plan
+terraform apply
+```
+
+Key outputs after apply:
+- **AWS:** `instance_profile_name` (attach to EC2 launch templates), `maintenance_window_id`, `sns_topic_arn`
+- **Azure:** `user_assigned_identity_client_id` (reference in VM identity blocks), `maintenance_config_linux_id`, `log_analytics_workspace_id`
+- **GCP:** `service_account_email` (assign to GCE VMs), `patch_deployment_linux_id`, `log_sink_bucket_name`
+
+To opt a VM into automated patching:
+- **AWS:** tag the instance with `ssm-patching = true`
+- **Azure:** create a `azurerm_maintenance_assignment` pointing to `maintenance_config_linux_id` or `maintenance_config_windows_id`
+- **GCP:** label the instance with `os-patch = enabled`
+
+### Phase 4 — Run a Patch Scan (no changes)
 ```bash
 # AWS: run compliance scan only
 aws ssm start-associations-once --association-ids <patch-scan-association-id>
@@ -587,7 +677,7 @@ gcloud compute os-config patch-jobs execute --project=$GCP_PROJECT \
   --dry-run --instance-filter-all
 ```
 
-### Phase 4 — Destroy All Test VMs
+### Phase 5 — Destroy All Test VMs
 ```bash
 ./scripts/destroy-vms.sh
 ```

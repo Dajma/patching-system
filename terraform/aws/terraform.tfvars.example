@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars and fill in values before running terraform plan/apply
+
+environment  = "dev"
+project_name = "patching-system"
+region       = "us-east-1"
+
+# SSM maintenance window (Saturday 02:00 UTC)
+patch_schedule_cron         = "cron(0 2 ? * SAT *)"
+maintenance_window_duration = 4
+maintenance_window_cutoff   = 1
+
+# Leave empty to skip SNS email subscription
+alert_email = ""
+
+s3_log_retention_days = 90
+
+tags = {
+  Owner   = "platform-team"
+  CostCenter = "infra"
+}
