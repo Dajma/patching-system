@@ -19,7 +19,8 @@ Enterprise-grade automated patching for Windows and Linux VMs across **AWS**, **
 11. [Security Considerations](#11-security-considerations)
 12. [Viewing Resources in Cloud Consoles](#12-viewing-resources-in-cloud-consoles)
 13. [Project Structure](#13-project-structure)
-14. [Quick Start](#14-quick-start)
+14. [Local Testing Scripts](#14-local-testing-scripts)
+15. [Quick Start](#15-quick-start)
 
 ---
 
@@ -520,7 +521,12 @@ patching-system/
 ├── scripts/
 │   ├── create-vms.sh                  # Provision test VMs (all 3 clouds)
 │   ├── destroy-vms.sh                 # Tear down all test VMs
-│   └── azure-service-account.sh      # Create scoped Azure SP for automation
+│   ├── azure-service-account.sh      # Create scoped Azure SP for automation
+│   ├── test-aws.sh                    # Manual SSM patch compliance test
+│   ├── test-azure.sh                  # Manual Azure Update Manager test
+│   ├── test-gcp.sh                    # Manual GCP OS Patch test
+│   ├── compliance-report.py           # Aggregate compliance across all clouds
+│   └── cleanup-all.sh                 # Destroy VMs + optional Terraform teardown
 │
 ├── iam/
 │   ├── aws-ssm-policy.json            # Least-privilege SSM policy
@@ -578,7 +584,102 @@ patching-system/
 ```
 
 ---
-## 14. Testing Strategy (Production Mindset)
+
+## 14. Local Testing Scripts
+
+After creating test VMs with `create-vms.sh`, use these scripts to manually verify that the patching infrastructure works end-to-end before relying on scheduled maintenance windows.
+
+### test-aws.sh — SSM Patch Compliance
+
+```bash
+# Auto-discovers test instances by tag (Environment=testing, Project=patching-system)
+./scripts/test-aws.sh
+
+# Or target a specific instance
+./scripts/test-aws.sh i-0abc1234567890def
+```
+
+Checks SSM agent registration, runs a compliance scan (`AWS-RunPatchBaseline Operation=Scan`), reports missing and critical patch counts, then offers to apply patches interactively.
+
+### test-azure.sh — Azure Update Manager
+
+```bash
+# Auto-discovers first VM in patching-system-rg tagged Environment=testing
+./scripts/test-azure.sh
+
+# Or target a specific VM
+./scripts/test-azure.sh patch-test-linux
+```
+
+Verifies VM power state, triggers `az vm assess-patches`, displays critical/security/other patch counts, then offers to install patches (`az vm install-patches`) with `IfRequired` reboot.
+
+### test-gcp.sh — GCP OS Config
+
+```bash
+# Auto-discovers instance by label (environment=testing, project=patching-system)
+./scripts/test-gcp.sh
+
+# Or target a specific instance
+./scripts/test-gcp.sh patch-test-linux
+```
+
+Checks OS Config agent inventory (confirms the agent is reporting), lists the last 5 patch jobs with status, then offers to execute a new patch job targeting that instance.
+
+### compliance-report.py — Multi-Cloud Aggregated Report
+
+```bash
+# All clouds (default)
+python3 ./scripts/compliance-report.py
+
+# Single cloud
+python3 ./scripts/compliance-report.py --aws
+python3 ./scripts/compliance-report.py --azure
+python3 ./scripts/compliance-report.py --gcp
+
+# JSON output for piping / scripting
+python3 ./scripts/compliance-report.py --json
+
+# Override defaults
+python3 ./scripts/compliance-report.py --region eu-west-1 --project my-gcp-project
+```
+
+Queries each cloud's CLI for patch state per VM and prints a color-coded compliance table. Exits with code 1 if any non-compliant or failed VMs are found (useful in CI).
+
+```
+☁️  Multi-Cloud Patch Compliance Report
+========================================
+Generated: 2026-05-10 14:00:00 UTC
+
+Cloud   VM                     OS       Status         Missing  Last Checked
+------  ---------------------  -------  -------------  -------  ----------------
+AWS     i-0abc123 (linux)      Linux    COMPLIANT      0        2026-05-10 14:00
+AWS     i-0def456 (windows)    Windows  NON_COMPLIANT  3        2026-05-10 14:00
+Azure   patch-test-linux       Linux    Succeeded      0        2026-05-10 14:05
+GCP     patch-test-linux       Linux    SUCCEEDED      0        2026-05-10 14:10
+```
+
+### cleanup-all.sh — Destroy All Test Resources
+
+```bash
+# Destroy test VMs only (wraps destroy-vms.sh)
+./scripts/cleanup-all.sh
+
+# Destroy VMs + all Terraform-managed infrastructure
+./scripts/cleanup-all.sh --include-terraform
+
+# Cloud-specific cleanup
+./scripts/cleanup-all.sh --aws-only
+./scripts/cleanup-all.sh --azure-only --include-terraform
+
+# Skip confirmation prompts
+./scripts/cleanup-all.sh --force
+```
+
+> **Warning:** `--include-terraform` removes SSM baselines, maintenance windows, Log Analytics workspaces, Pub/Sub topics, and GCS buckets. Use with care in shared environments.
+
+---
+## Testing Strategy (Production Mindset)
+
 
 ### Pre-Patch Validation
 - Patch staging environment first (dev → qa → prod)
