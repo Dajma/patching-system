@@ -786,3 +786,30 @@ gcloud compute os-config patch-jobs execute --project=$GCP_PROJECT \
 ---
 
 *This system follows [NIST SP 800-40r3](https://csrc.nist.gov/publications/detail/sp/800-40/rev-3/final) "Guide to Enterprise Patch Management Planning" and [CIS Controls v8](https://www.cisecurity.org/controls/v8) Control 7 (Continuous Vulnerability Management).*
+
+---
+
+## Resources Created
+
+All resources are tagged `Purpose=Learning, AutoDestroy=true` and scoped to the Visual Studio Enterprise Subscription to avoid any impact on shared Entra ID or other subscriptions.
+
+### Azure (Subscription: `2f791c46-1726-4a0c-94e8-48314ac8f1b4`)
+
+| Resource | Type | Name | Notes |
+|----------|------|------|-------|
+| Service Principal | Entra ID App Registration | `patching-system-sp` | App ID: `1f53f953-57b0-4e8d-9cb9-7ea97b1c6487` |
+| Custom RBAC Role | Role Definition | `Patching System Operator` | 19 least-privilege actions; assignable to this subscription only |
+| Role Assignment | RBAC Assignment | `patching-system-sp` → `Patching System Operator` | Scope: `/subscriptions/2f791c46-1726-4a0c-94e8-48314ac8f1b4` |
+
+**Where to find them in the portal:**
+- Service Principal: [Entra ID → App registrations → All applications](https://portal.azure.com/#view/Microsoft_AAD_IAM/ActiveDirectoryMenuBlade/~/RegisteredApps) → search `patching-system-sp`
+- Custom Role: Subscriptions → Visual Studio Enterprise → Access control (IAM) → Roles → filter `Type = CustomRole`
+- Role Assignment: Subscriptions → Visual Studio Enterprise → Access control (IAM) → Role assignments → search `patching-system-sp`
+
+### AWS
+
+_No resources created yet._
+
+### GCP
+
+_No resources created yet._
