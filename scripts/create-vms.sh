@@ -317,6 +317,9 @@ if [[ "$RUN_AWS" == "true" ]]; then
       --protocol -1 --port -1 --cidr 0.0.0.0/0 --region "$AWS_REGION" 2>/dev/null || true
     aws ec2 authorize-security-group-egress --group-id "$SG_ID" \
       --protocol tcp --port 443 --cidr 0.0.0.0/0 --region "$AWS_REGION" > /dev/null
+    # Port 80 needed for Windows root certificate downloads (ctldl.windowsupdate.com)
+    aws ec2 authorize-security-group-egress --group-id "$SG_ID" \
+      --protocol tcp --port 80 --cidr 0.0.0.0/0 --region "$AWS_REGION" > /dev/null
 
     aws ec2 create-tags --resources "$SG_ID" \
       --tags Key=Name,Value="${PREFIX}-sg" Key=Project,Value=patching-system --region "$AWS_REGION"

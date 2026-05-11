@@ -68,10 +68,15 @@ def gather_aws(region):
         )
         if state:
             raw_status = state.get('OperationStatus')
-            # OperationStatus is null when SSM hasn't completed a patch cycle yet
-            status  = raw_status if raw_status else 'Pending'
-            missing = state.get('MissingCount', '?')
-            checked = str(state.get('OperationEndTime') or state.get('OperationStartTime') or 'N/A')[:16]
+            missing    = state.get('MissingCount', '?')
+            checked    = str(state.get('OperationEndTime') or state.get('OperationStartTime') or 'N/A')[:16]
+            if raw_status:
+                status = raw_status
+            elif checked != 'N/A':
+                # Manual send-command scans don't set OperationStatus; derive from MissingCount
+                status = 'Compliant' if missing == 0 else 'NON_COMPLIANT'
+            else:
+                status = 'Pending'
         else:
             status, missing, checked = 'Not Scanned', '?', 'N/A'
         rows.append({
