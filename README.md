@@ -18,9 +18,11 @@ Enterprise-grade automated patching for Windows and Linux VMs across **AWS**, **
 10. [When to Patch vs When to Use Immutable Images](#10-when-to-patch-vs-when-to-use-immutable-images)
 11. [Security Considerations](#11-security-considerations)
 12. [Viewing Resources in Cloud Consoles](#12-viewing-resources-in-cloud-consoles)
-13. [Project Structure](#13-project-structure)
-14. [Local Testing Scripts](#14-local-testing-scripts)
-15. [Quick Start](#15-quick-start)
+13. [Checking Patch Compliance in the Console](#13-checking-patch-compliance-in-the-console)
+14. [Creating the Patching Solution via the Console](#14-creating-the-patching-solution-via-the-console)
+15. [Project Structure](#15-project-structure)
+16. [Local Testing Scripts](#16-local-testing-scripts)
+17. [Quick Start](#17-quick-start)
 
 ---
 
@@ -510,7 +512,268 @@ VPC / VNet / VPC (GCP)
 
 ---
 
-## 13. Project Structure
+## 13. Checking Patch Compliance in the Console
+
+Use these steps to verify patch status, agent health, and compliance for each VM without running any CLI commands.
+
+---
+
+### AWS — Systems Manager Console
+
+**1. Confirm instances are SSM-managed**
+
+1. Open the [AWS Console](https://console.aws.amazon.com) and navigate to **Systems Manager**
+2. In the left sidebar click **Fleet Manager**
+3. Confirm both `patch-test-linux` and `patch-test-windows` appear with **SSM Agent status: Online**
+4. If an instance is missing, the IAM instance profile or outbound HTTPS connectivity is the likely cause
+
+**2. Check patch compliance per instance**
+
+1. In Systems Manager, click **Patch Manager** in the left sidebar
+2. Click the **Dashboard** tab — this shows fleet-wide compliance percentages
+3. Click **Compliance reporting** tab for a per-instance breakdown
+4. Find your instance in the list; the **Compliance status** column shows `Compliant` or `Non-compliant`
+5. Click the instance ID to drill into individual missing patches, their CVE IDs, and severity
+
+**3. Inspect the last patch operation**
+
+1. In **Patch Manager**, click **Patch now** history or go to **Run Command** → **Command history**
+2. Filter by document name `AWS-RunPatchBaseline`
+3. Click a command ID → **Instance** tab to see per-instance stdout/stderr including patch counts
+
+**4. View patch state via Compliance explorer**
+
+1. In Systems Manager, click **Compliance** in the left sidebar
+2. Set **Compliance type** filter to `Patch`
+3. Non-compliant instances appear in red with missing patch counts
+4. Click any instance to see which specific patches are missing and their classification (Security, Critical, etc.)
+
+---
+
+### Azure — Update Manager Console
+
+**1. Open Update Manager**
+
+1. Open the [Azure Portal](https://portal.azure.com) and search **Update Manager** in the top search bar
+2. Select **Azure Update Manager** from the results (under Services)
+3. The **Overview** page shows fleet-wide compliance — total VMs assessed, compliant count, and pending update counts
+
+**2. Check compliance per VM**
+
+1. In Update Manager, click **Machines** in the left menu
+2. All VMs enrolled in Update Manager appear with their **Update status** (Up to date / Updates available / Assessment needed)
+3. Click a VM name → **Updates** tab to see available updates grouped by classification (Critical, Security, Other)
+4. The **History** tab shows all past assessment and installation operations with timestamps and results
+
+**3. Review the latest assessment**
+
+1. In Update Manager, click **History** in the left menu
+2. Filter by **Operation type: Assessment**
+3. Click a row to see which VMs were assessed, when, and what was found
+4. A status of `Succeeded` confirms the Update Manager agent successfully inventoried the VM
+
+**4. Check for critical pending updates**
+
+1. In Update Manager, click **Pending updates** in the left menu
+2. Filter by **Classification: Critical** or **Security**
+3. This shows exactly which KB articles or packages are outstanding across your entire fleet
+4. Use the **Install now** button to apply them immediately outside a maintenance window
+
+---
+
+### GCP — VM Manager Console
+
+**1. Open VM Manager**
+
+1. Open the [GCP Console](https://console.cloud.google.com) and select project **learn-image-project**
+2. Navigate to **Compute Engine** → **VM Manager** (in the left sidebar under Compute Engine)
+3. The **Dashboard** tab shows OS inventory coverage and recent patch job status
+
+**2. Check patch job results**
+
+1. In VM Manager, click **Patch jobs** in the left menu
+2. The list shows all historical patch jobs with state (SUCCEEDED, FAILED, COMPLETED_WITH_ERRORS)
+3. Click a job → **Instance details** tab to see the per-instance result (SUCCEEDED, FAILED, SKIPPED)
+4. Dry-run jobs (used for scanning) show patch counts without applying changes
+
+**3. Inspect OS inventory per instance**
+
+1. In VM Manager, click **OS inventory** in the left menu
+2. Search for `patch-test-linux` or `patch-test-windows`
+3. Click an instance to see its full installed package list, versions, and available updates
+4. The **Installed packages** tab confirms the OS Config agent is reporting inventory
+5. The **Available updates** tab shows packages with newer versions available in the distro repo
+
+**4. View patch deployments (schedules)**
+
+1. In VM Manager, click **Patch deployments** in the left menu
+2. Each deployment shows its schedule (cron), last run time, and next run time
+3. Click a deployment → **Job history** to trace every scheduled run and its outcome
+
+---
+
+## 14. Creating the Patching Solution via the Console
+
+These steps reproduce everything this project does — entirely through cloud consoles, without CLI or Terraform. Useful for understanding what the automation creates under the hood, or for one-off setup in accounts where IaC isn't yet established.
+
+---
+
+### AWS — Systems Manager Patch Manager
+
+**Prerequisites:** EC2 instances must have outbound HTTPS (port 443) and an IAM role with `AmazonSSMManagedInstanceCore` attached.
+
+**Step 1 — Create an IAM role for SSM**
+
+1. Go to **IAM** → **Roles** → **Create role**
+2. Trusted entity: **AWS service** → **EC2**
+3. Attach policy: search and select `AmazonSSMManagedInstanceCore`
+4. Name the role `patching-ssm-role` → **Create role**
+
+**Step 2 — Attach the role to your EC2 instances**
+
+1. Go to **EC2** → **Instances** → select your instance
+2. **Actions** → **Security** → **Modify IAM role**
+3. Select `patching-ssm-role` → **Update IAM role**
+4. Wait 2–3 minutes, then go to **Systems Manager** → **Fleet Manager** to confirm the instance appears with status **Online**
+
+**Step 3 — Create a patch baseline**
+
+1. In Systems Manager, go to **Patch Manager** → **Patch baselines** → **Create patch baseline**
+2. **Name:** `patching-system-linux-baseline`
+3. **Operating system:** Amazon Linux 2023 (repeat for Windows)
+4. Under **Approval rules**, add a rule:
+   - Classification: `Security`, `Critical`, `Bugfix`
+   - Severity: All
+   - Auto-approval delay: `3 days`
+5. Click **Create patch baseline**
+6. Select the baseline → **Actions** → **Set as default** for that OS
+
+**Step 4 — Create a maintenance window**
+
+1. In Systems Manager, go to **Maintenance Windows** → **Create maintenance window**
+2. **Name:** `patching-system-weekly`
+3. **Schedule:** CRON expression `cron(0 2 ? * SUN *)` (Sundays at 02:00 UTC)
+4. **Duration:** 4 hours; **Stop initiating tasks:** 1 hour before end
+5. Click **Create maintenance window**
+
+**Step 5 — Register targets and the patch task**
+
+1. Click your new maintenance window → **Targets** tab → **Register targets**
+2. **Target by:** Tag → Key: `Project` / Value: `patching-system`
+3. **Name:** `all-patching-vms` → **Register target**
+4. Click **Tasks** tab → **Register tasks** → **Register Run Command task**
+5. **Document:** `AWS-RunPatchBaseline`
+6. **Parameters:** Operation = `Install`, RebootOption = `RebootIfNeeded`
+7. **Targets:** select the target group you just created
+8. **IAM service role:** create or select a role with `ssm:SendCommand` permission
+9. Click **Register Run Command task**
+
+**Step 6 — Run an on-demand compliance scan**
+
+1. In Patch Manager, click **Patch now**
+2. Select **Scan only** (no changes applied)
+3. Choose **All instances** or filter by tag
+4. Click **Patch now** — a Run Command job fires immediately
+5. Go to **Compliance** to see results within 5 minutes
+
+---
+
+### Azure — Update Manager
+
+**Prerequisites:** VMs must be running a supported OS and have the Azure VM Agent installed (it is pre-installed on all Azure Marketplace images).
+
+**Step 1 — Enable periodic assessment on existing VMs**
+
+1. Open **Update Manager** → **Machines**
+2. Select your VMs (tick the checkboxes) → **Settings** → **Update settings**
+3. Under **Periodic assessment**, set to **Enable** → **Save**
+4. Azure now automatically assesses these VMs every 24 hours
+
+**Step 2 — Run an immediate assessment**
+
+1. In **Update Manager** → **Machines**, select your VMs
+2. Click **Check for updates** at the top
+3. The assessment runs in the background (1–5 minutes)
+4. Refresh the **Machines** list; the **Last assessment** column updates with fresh results
+
+**Step 3 — Create a maintenance configuration**
+
+1. In Update Manager, click **Maintenance configurations** → **Create**
+2. **Subscription:** your subscription; **Resource group:** `patching-system-rg`
+3. **Name:** `patching-system-weekly`
+4. **Maintenance scope:** Guest (in-VM patching)
+5. **Schedule:** weekly, Sunday 02:00 UTC, duration 4 hours
+6. **Updates to include:** Classification → Critical, Security
+7. **Reboot setting:** Reboot if required
+8. Click **Review + create** → **Create**
+
+**Step 4 — Assign VMs to the maintenance configuration**
+
+1. Open the maintenance configuration you just created
+2. Click **Machines** → **Add machines**
+3. Select `patch-test-linux` and `patch-test-win`
+4. Click **Add** — these VMs will now be patched on the defined schedule
+
+**Step 5 — Install patches immediately (optional)**
+
+1. In Update Manager → **Machines**, select your VMs
+2. Click **Install updates**
+3. Choose **All updates** or filter by classification
+4. Set **Reboot option** → **Reboot if required**
+5. Click **Install** — a patch job starts immediately; track progress in **History**
+
+---
+
+### GCP — VM Manager (OS Config)
+
+**Prerequisites:** The VM Manager API must be enabled and the OS Config agent must be installed on the VMs (pre-installed on all official GCE images from Debian 10+, RHEL 8+, Windows Server 2016+).
+
+**Step 1 — Enable the VM Manager API**
+
+1. In the GCP Console, go to **APIs & Services** → **Enable APIs and services**
+2. Search for **VM Manager** or **OS Config API** (`osconfig.googleapis.com`)
+3. Click **Enable**
+
+**Step 2 — Enable OS Config agent project-wide**
+
+1. Go to **Compute Engine** → **Settings** (at the bottom of the left sidebar)
+2. Click the **Metadata** tab → **Edit**
+3. Add a metadata entry: Key = `enable-osconfig`, Value = `true`
+4. Click **Save** — this enables the OS Config agent on all new and existing VMs in the project
+
+**Step 3 — Verify agents are reporting**
+
+1. Go to **Compute Engine** → **VM Manager** → **OS inventory**
+2. Your instances should appear within 15–30 minutes of the agent starting
+3. If an instance does not appear, SSH in and run: `sudo systemctl status google-osconfig-agent`
+
+**Step 4 — Run an on-demand patch scan (dry run)**
+
+1. In VM Manager, click **Patch jobs** → **New patch job**
+2. **Instance filter:** All instances (or filter by label `project=patching-system`)
+3. **Patch configuration:** Apt / Yum / Windows Update (leave as default for all OS types)
+4. Tick **Dry run** — this scans without applying any changes
+5. Click **Run** — the job appears in the list; click it to track per-instance progress
+
+**Step 5 — Create a recurring patch deployment**
+
+1. In VM Manager, click **Patch deployments** → **Create deployment**
+2. **Name:** `patching-system-weekly`
+3. **Instance filter:** Label — Key: `project`, Value: `patching-system`
+4. **Patch config:** leave defaults (applies all available updates)
+5. **Schedule:** Weekly, Sunday 04:00 UTC
+6. **Reboot:** Default (reboot only if required by the patch)
+7. Click **Deploy** — GCP will automatically run a patch job every Sunday at 04:00 UTC
+
+**Step 6 — View results**
+
+1. After the deployment runs, go to **Patch jobs** to see the triggered job
+2. Click the job → **Instance details** to see pass/fail per VM
+3. Go to **OS inventory** → select a VM → **Available updates** to confirm the installed count dropped after patching
+
+---
+
+## 15. Project Structure
 
 ```
 patching-system/
