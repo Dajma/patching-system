@@ -2,6 +2,9 @@
 # create-vms.sh — Provision cheapest test VMs across AWS, Azure, and GCP
 # Tags: Environment=testing, Project=patching-system, TTL=24h
 # Each VM has the cloud-native patch agent pre-installed or activated.
+#
+# Creation order: Azure → GCP → AWS  (AWS is paid; Azure/GCP have free credits)
+# Destroy order:  AWS first           (see destroy-vms.sh)
 
 set -euo pipefail
 
@@ -123,16 +126,150 @@ EOF
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AWS
+# AZURE  [1/3 — free credits, created first]
+# VM type:  Standard_D2s_v3 (2 vCPU, 8 GB) — available in centralus: ~$0.096/hr
+# Linux:    Ubuntu 22.04 LTS (Azure Monitor Agent auto-enabled via policy)
+# Windows:  Windows Server 2022 Datacenter (Windows Update Agent built-in)
+# Auth:     System-assigned managed identity + Update Manager role
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ "$RUN_AZURE" == "true" ]]; then
+  log "=== Azure: Creating VMs ==="
+
+  # ── Resource group ────────────────────────────────────────────────────────
+  if ! az group show --name "$RESOURCE_GROUP" --subscription "$AZURE_SUBSCRIPTION_ID" > /dev/null 2>&1; then
+    az group create \
+      --name "$RESOURCE_GROUP" \
+      --location "$AZURE_REGION" \
+      --subscription "$AZURE_SUBSCRIPTION_ID" \
+      --tags $AZURE_TAGS \
+      --output none
+    ok "Resource group created: $RESOURCE_GROUP"
+  else
+    ok "Resource group already exists: $RESOURCE_GROUP"
+  fi
+
+  AZURE_LINUX_NAME="${PREFIX}-linux"
+  az vm create \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$AZURE_LINUX_NAME" \
+    --image Ubuntu2204 \
+    --size Standard_D2s_v3 \
+    --admin-username azureuser \
+    --generate-ssh-keys \
+    --assign-identity "[system]" \
+    --public-ip-sku Standard \
+    --tags $AZURE_TAGS OS=linux \
+    --subscription "$AZURE_SUBSCRIPTION_ID" \
+    --output none \
+    --no-wait
+  ok "Azure Linux VM creation started: $AZURE_LINUX_NAME"
+
+  AZURE_WINDOWS_NAME="${PREFIX}-win"
+  AZURE_WIN_PASSWORD=$(openssl rand -base64 16 | tr -d '/+=' | head -c16)Aa1!
+
+  az vm create \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$AZURE_WINDOWS_NAME" \
+    --image Win2022Datacenter \
+    --size Standard_D2s_v3 \
+    --admin-username azureuser \
+    --admin-password "$AZURE_WIN_PASSWORD" \
+    --assign-identity "[system]" \
+    --public-ip-sku Standard \
+    --tags $AZURE_TAGS OS=windows \
+    --subscription "$AZURE_SUBSCRIPTION_ID" \
+    --output none \
+    --no-wait
+  ok "Azure Windows VM creation started: $AZURE_WINDOWS_NAME"
+
+  cat >> "$STATE_FILE" <<EOF
+AZURE_RG="$RESOURCE_GROUP"
+AZURE_LINUX_NAME="$AZURE_LINUX_NAME"
+AZURE_WINDOWS_NAME="$AZURE_WINDOWS_NAME"
+EOF
+
+  log "Waiting for Azure VMs to finish provisioning (this takes 3-5 min)..."
+  az vm wait --created --resource-group "$RESOURCE_GROUP" \
+    --name "$AZURE_LINUX_NAME" --subscription "$AZURE_SUBSCRIPTION_ID"
+  az vm wait --created --resource-group "$RESOURCE_GROUP" \
+    --name "$AZURE_WINDOWS_NAME" --subscription "$AZURE_SUBSCRIPTION_ID"
+  ok "Azure VMs running"
+
+  log "Enabling periodic assessment on Azure VMs..."
+  for VM in "$AZURE_LINUX_NAME" "$AZURE_WINDOWS_NAME"; do
+    az vm assess-patches \
+      --resource-group "$RESOURCE_GROUP" \
+      --name "$VM" \
+      --subscription "$AZURE_SUBSCRIPTION_ID" \
+      --output none 2>/dev/null || true
+  done
+  ok "Azure patch assessment triggered"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GCP  [2/3 — free credits, created second]
+# VM type:  e2-micro (2 vCPU shared, 1 GB) — cheapest GCE: ~$0.0067/hr
+#           n1-standard-1 (1 vCPU, 3.75 GB) — cheapest Windows-capable: ~$0.035/hr
+# Linux:    Debian 12 (OS Config Agent pre-installed on all official GCE images)
+# Windows:  Windows Server 2022 (OS Config Agent included)
+# Auth:     Compute service account with osconfig.patchJobExecutor role
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ "$RUN_GCP" == "true" ]]; then
+  log "=== GCP: Creating VMs ==="
+
+  log "Enabling GCP APIs (osconfig, compute)..."
+  gcloud services enable osconfig.googleapis.com compute.googleapis.com \
+    --project "$GCP_PROJECT" --quiet
+  ok "GCP APIs enabled"
+
+  gcloud compute project-info add-metadata \
+    --metadata enable-osconfig=true \
+    --project "$GCP_PROJECT" --quiet
+  ok "OS Config enabled project-wide"
+
+  GCP_LINUX_NAME="${PREFIX}-linux"
+  gcloud compute instances create "$GCP_LINUX_NAME" \
+    --project "$GCP_PROJECT" \
+    --zone "$GCP_ZONE" \
+    --machine-type e2-micro \
+    --image-project debian-cloud \
+    --image-family debian-12 \
+    --labels "$GCP_LABELS,os=linux" \
+    --metadata "enable-osconfig=true" \
+    --scopes "https://www.googleapis.com/auth/cloud-platform" \
+    --quiet
+  ok "GCP Linux VM created: $GCP_LINUX_NAME"
+
+  GCP_WINDOWS_NAME="${PREFIX}-windows"
+  gcloud compute instances create "$GCP_WINDOWS_NAME" \
+    --project "$GCP_PROJECT" \
+    --zone "$GCP_ZONE" \
+    --machine-type n1-standard-1 \
+    --image-project windows-cloud \
+    --image-family windows-2022 \
+    --labels "$GCP_LABELS,os=windows" \
+    --metadata "enable-osconfig=true,sysprep-specialize-script-ps1=Set-Service -Name 'google-osconfig-agent' -StartupType Automatic" \
+    --scopes "https://www.googleapis.com/auth/cloud-platform" \
+    --quiet
+  ok "GCP Windows VM created: $GCP_WINDOWS_NAME"
+
+  cat >> "$STATE_FILE" <<EOF
+GCP_LINUX_NAME="$GCP_LINUX_NAME"
+GCP_WINDOWS_NAME="$GCP_WINDOWS_NAME"
+GCP_ZONE="$GCP_ZONE"
+EOF
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AWS  [3/3 — paid account, created last to minimise billable time]
 # VM type:  t3.micro (2 vCPU, 1 GB) — ~$0.0104/hr Linux, ~$0.0164/hr Windows
-# Linux:    Amazon Linux 2023 (SSM Agent built-in, free tier)
+# Linux:    Amazon Linux 2023 (SSM Agent built-in)
 # Windows:  Windows Server 2022 Base (SSM Agent built-in)
 # Auth:     IAM Instance Profile with AmazonSSMManagedInstanceCore
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$RUN_AWS" == "true" ]]; then
   log "=== AWS: Creating VMs ==="
 
-  # ── IAM instance profile for SSM ────────────────────────────────────────────
   ROLE_NAME="patching-system-ssm-role"
   PROFILE_NAME="patching-system-ssm-profile"
 
@@ -161,7 +298,6 @@ if [[ "$RUN_AWS" == "true" ]]; then
     ok "Instance profile $PROFILE_NAME already exists"
   fi
 
-  # ── Security group: outbound 443 only (no inbound) ───────────────────────
   VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
     --query 'Vpcs[0].VpcId' --output text --region "$AWS_REGION")
   [[ "$VPC_ID" == "None" || -z "$VPC_ID" ]] && die "No default VPC found in $AWS_REGION"
@@ -177,7 +313,6 @@ if [[ "$RUN_AWS" == "true" ]]; then
       --vpc-id "$VPC_ID" \
       --query 'GroupId' --output text --region "$AWS_REGION")
 
-    # Remove default outbound rule and re-add only 443
     aws ec2 revoke-security-group-egress --group-id "$SG_ID" \
       --protocol -1 --port -1 --cidr 0.0.0.0/0 --region "$AWS_REGION" 2>/dev/null || true
     aws ec2 authorize-security-group-egress --group-id "$SG_ID" \
@@ -190,7 +325,6 @@ if [[ "$RUN_AWS" == "true" ]]; then
     ok "Security group already exists: $SG_ID"
   fi
 
-  # ── Amazon Linux 2023 (latest) ────────────────────────────────────────────
   AL2023_AMI=$(aws ssm get-parameter \
     --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64 \
     --query 'Parameter.Value' --output text --region "$AWS_REGION")
@@ -207,7 +341,6 @@ if [[ "$RUN_AWS" == "true" ]]; then
     --query 'Instances[0].InstanceId' --output text --region "$AWS_REGION")
   ok "AWS Linux VM: $AWS_LINUX_ID"
 
-  # ── Windows Server 2022 ───────────────────────────────────────────────────
   WIN2022_AMI=$(aws ssm get-parameter \
     --name /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base \
     --query 'Parameter.Value' --output text --region "$AWS_REGION")
@@ -224,7 +357,6 @@ if [[ "$RUN_AWS" == "true" ]]; then
     --query 'Instances[0].InstanceId' --output text --region "$AWS_REGION")
   ok "AWS Windows VM: $AWS_WINDOWS_ID"
 
-  # Save state
   cat >> "$STATE_FILE" <<EOF
 AWS_LINUX_ID="$AWS_LINUX_ID"
 AWS_WINDOWS_ID="$AWS_WINDOWS_ID"
@@ -237,162 +369,17 @@ EOF
   ok "AWS VMs running"
 fi
 
-# ══════════════════════════════════════════════════════════════════════════════
-# AZURE
-# VM type:  Standard_D2s_v3 (2 vCPU, 8 GB) — available in centralus: ~$0.096/hr
-#           Standard_D2s_v3 (2 vCPU, 8 GB) — same SKU for Windows
-# Linux:    Ubuntu 22.04 LTS (Azure Monitor Agent auto-enabled via policy)
-# Windows:  Windows Server 2022 Datacenter (Windows Update Agent built-in)
-# Auth:     System-assigned managed identity + Update Manager role
-# ══════════════════════════════════════════════════════════════════════════════
-if [[ "$RUN_AZURE" == "true" ]]; then
-  log "=== Azure: Creating VMs ==="
-
-  # ── Resource group ────────────────────────────────────────────────────────
-  if ! az group show --name "$RESOURCE_GROUP" --subscription "$AZURE_SUBSCRIPTION_ID" > /dev/null 2>&1; then
-    az group create \
-      --name "$RESOURCE_GROUP" \
-      --location "$AZURE_REGION" \
-      --subscription "$AZURE_SUBSCRIPTION_ID" \
-      --tags $AZURE_TAGS \
-      --output none
-    ok "Resource group created: $RESOURCE_GROUP"
-  else
-    ok "Resource group already exists: $RESOURCE_GROUP"
-  fi
-
-  # ── Ubuntu 22.04 LTS VM (Standard_B1s) ───────────────────────────────────
-  AZURE_LINUX_NAME="${PREFIX}-linux"
-  az vm create \
-    --resource-group "$RESOURCE_GROUP" \
-    --name "$AZURE_LINUX_NAME" \
-    --image Ubuntu2204 \
-    --size Standard_D2s_v3 \
-    --admin-username azureuser \
-    --generate-ssh-keys \
-    --assign-identity "[system]" \
-    --public-ip-sku Standard \
-    --tags $AZURE_TAGS OS=linux \
-    --subscription "$AZURE_SUBSCRIPTION_ID" \
-    --output none \
-    --no-wait
-  ok "Azure Linux VM creation started: $AZURE_LINUX_NAME"
-
-  # ── Windows Server 2022 VM (Standard_B2s) ────────────────────────────────
-  AZURE_WINDOWS_NAME="${PREFIX}-win"
-  AZURE_WIN_PASSWORD=$(openssl rand -base64 16 | tr -d '/+=' | head -c16)Aa1!
-
-  az vm create \
-    --resource-group "$RESOURCE_GROUP" \
-    --name "$AZURE_WINDOWS_NAME" \
-    --image Win2022Datacenter \
-    --size Standard_D2s_v3 \
-    --admin-username azureuser \
-    --admin-password "$AZURE_WIN_PASSWORD" \
-    --assign-identity "[system]" \
-    --public-ip-sku Standard \
-    --tags $AZURE_TAGS OS=windows \
-    --subscription "$AZURE_SUBSCRIPTION_ID" \
-    --output none \
-    --no-wait
-  ok "Azure Windows VM creation started: $AZURE_WINDOWS_NAME"
-
-  # Save state (don't save the password to state — it's ephemeral)
-  cat >> "$STATE_FILE" <<EOF
-AZURE_RG="$RESOURCE_GROUP"
-AZURE_LINUX_NAME="$AZURE_LINUX_NAME"
-AZURE_WINDOWS_NAME="$AZURE_WINDOWS_NAME"
-EOF
-
-  log "Waiting for Azure VMs to finish provisioning (this takes 3-5 min)..."
-  az vm wait --created --resource-group "$RESOURCE_GROUP" \
-    --name "$AZURE_LINUX_NAME" --subscription "$AZURE_SUBSCRIPTION_ID"
-  az vm wait --created --resource-group "$RESOURCE_GROUP" \
-    --name "$AZURE_WINDOWS_NAME" --subscription "$AZURE_SUBSCRIPTION_ID"
-  ok "Azure VMs running"
-
-  # ── Enable Azure Update Manager patch assessment ──────────────────────────
-  log "Enabling periodic assessment on Azure VMs..."
-  for VM in "$AZURE_LINUX_NAME" "$AZURE_WINDOWS_NAME"; do
-    az vm assess-patches \
-      --resource-group "$RESOURCE_GROUP" \
-      --name "$VM" \
-      --subscription "$AZURE_SUBSCRIPTION_ID" \
-      --output none 2>/dev/null || true
-  done
-  ok "Azure patch assessment triggered"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GCP
-# VM type:  e2-micro (2 vCPU shared, 1 GB) — cheapest GCE: ~$0.0067/hr
-#           n1-standard-1 (1 vCPU, 3.75 GB) — cheapest Windows-capable: ~$0.035/hr
-# Linux:    Debian 12 (OS Config Agent pre-installed on all official GCE images)
-# Windows:  Windows Server 2022 (OS Config Agent included)
-# Auth:     Compute service account with osconfig.patchJobExecutor role
-# ══════════════════════════════════════════════════════════════════════════════
-if [[ "$RUN_GCP" == "true" ]]; then
-  log "=== GCP: Creating VMs ==="
-
-  # ── Enable required APIs ──────────────────────────────────────────────────
-  log "Enabling GCP APIs (osconfig, compute)..."
-  gcloud services enable osconfig.googleapis.com compute.googleapis.com \
-    --project "$GCP_PROJECT" --quiet
-  ok "GCP APIs enabled"
-
-  # ── Enable OS Config for the project ─────────────────────────────────────
-  gcloud compute project-info add-metadata \
-    --metadata enable-osconfig=true \
-    --project "$GCP_PROJECT" --quiet
-  ok "OS Config enabled project-wide"
-
-  # ── Debian 12 (e2-micro) ─────────────────────────────────────────────────
-  GCP_LINUX_NAME="${PREFIX}-linux"
-  gcloud compute instances create "$GCP_LINUX_NAME" \
-    --project "$GCP_PROJECT" \
-    --zone "$GCP_ZONE" \
-    --machine-type e2-micro \
-    --image-project debian-cloud \
-    --image-family debian-12 \
-    --labels "$GCP_LABELS,os=linux" \
-    --metadata "enable-osconfig=true" \
-    --scopes "https://www.googleapis.com/auth/cloud-platform" \
-    --quiet
-  ok "GCP Linux VM created: $GCP_LINUX_NAME"
-
-  # ── Windows Server 2022 (n1-standard-1 — minimum for Windows) ────────────
-  GCP_WINDOWS_NAME="${PREFIX}-windows"
-  gcloud compute instances create "$GCP_WINDOWS_NAME" \
-    --project "$GCP_PROJECT" \
-    --zone "$GCP_ZONE" \
-    --machine-type n1-standard-1 \
-    --image-project windows-cloud \
-    --image-family windows-2022 \
-    --labels "$GCP_LABELS,os=windows" \
-    --metadata "enable-osconfig=true,sysprep-specialize-script-ps1=Set-Service -Name 'google-osconfig-agent' -StartupType Automatic" \
-    --scopes "https://www.googleapis.com/auth/cloud-platform" \
-    --quiet
-  ok "GCP Windows VM created: $GCP_WINDOWS_NAME"
-
-  # Save state
-  cat >> "$STATE_FILE" <<EOF
-GCP_LINUX_NAME="$GCP_LINUX_NAME"
-GCP_WINDOWS_NAME="$GCP_WINDOWS_NAME"
-GCP_ZONE="$GCP_ZONE"
-EOF
-fi
-
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  VM CREATION COMPLETE"
 echo "═══════════════════════════════════════════════════════════════"
-[[ "$RUN_AWS" == "true" ]] && echo "  AWS Linux:    $AWS_LINUX_ID  ($AWS_REGION)"
-[[ "$RUN_AWS" == "true" ]] && echo "  AWS Windows:  $AWS_WINDOWS_ID ($AWS_REGION)"
 [[ "$RUN_AZURE" == "true" ]] && echo "  Azure Linux:  $AZURE_LINUX_NAME  ($AZURE_REGION)"
 [[ "$RUN_AZURE" == "true" ]] && echo "  Azure Windows:$AZURE_WINDOWS_NAME ($AZURE_REGION)"
 [[ "$RUN_GCP" == "true" ]] && echo "  GCP Linux:    $GCP_LINUX_NAME  ($GCP_ZONE)"
 [[ "$RUN_GCP" == "true" ]] && echo "  GCP Windows:  $GCP_WINDOWS_NAME ($GCP_ZONE)"
+[[ "$RUN_AWS" == "true" ]] && echo "  AWS Linux:    $AWS_LINUX_ID  ($AWS_REGION)"
+[[ "$RUN_AWS" == "true" ]] && echo "  AWS Windows:  $AWS_WINDOWS_ID ($AWS_REGION)"
 echo ""
 echo "  State saved to: $STATE_FILE"
 echo "  To destroy all VMs: ./scripts/destroy-vms.sh"
