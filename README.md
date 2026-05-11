@@ -806,10 +806,36 @@ All resources are tagged `Purpose=Learning, AutoDestroy=true` and scoped to the 
 - Custom Role: Subscriptions → Visual Studio Enterprise → Access control (IAM) → Roles → filter `Type = CustomRole`
 - Role Assignment: Subscriptions → Visual Studio Enterprise → Access control (IAM) → Role assignments → search `patching-system-sp`
 
-### AWS
+### AWS (Account: `089523922997`)
 
-_No resources created yet._
+| Resource | Type | Name | Status | Notes |
+|----------|------|------|--------|-------|
+| IAM User | IAM | `project-user` | **Persistent** | Admin access; default CLI profile for this project |
+| IAM Role | IAM | `patching-system-ssm-role` | Ephemeral — destroyed | Created/deleted with test VMs; grants `AmazonSSMManagedInstanceCore` to EC2 |
+| IAM Instance Profile | IAM | `patching-system-ssm-profile` | Ephemeral — destroyed | Attached to test EC2 instances during patching tests |
+| EC2 Instance | EC2 | `patch-test-linux` | Ephemeral — destroyed | Amazon Linux 2023, t3.micro; used to verify SSM agent registration |
+| EC2 Instance | EC2 | `patch-test-windows` | Ephemeral — destroyed | Windows Server 2022, t3.micro; used to verify SSM agent registration |
 
-### GCP
+**Where to find persistent resources:**
+- IAM User: AWS Console → IAM → Users → `project-user`
 
-_No resources created yet._
+### GCP (Project: `learn-image-project`)
+
+| Resource | Type | Name | Status | Notes |
+|----------|------|------|--------|-------|
+| API | Service | `osconfig.googleapis.com` | **Persistent** | OS Config API enabled project-wide |
+| Project Metadata | Compute | `enable-osconfig=true` | **Persistent** | Enables OS Config agent on all VMs in the project |
+| VM Instance | Compute | `patch-test-linux` | Ephemeral — destroyed | Debian 12, e2-micro; verified OS Config agent inventory reporting |
+| VM Instance | Compute | `patch-test-windows` | Ephemeral — destroyed | Windows Server 2022, n1-standard-1; verified OS Config agent inventory reporting |
+
+**Where to find persistent resources:**
+- API status: GCP Console → APIs & Services → Enabled APIs → search `osconfig`
+- Project metadata: GCP Console → Compute Engine → Settings → Metadata
+
+### Azure — Ephemeral Test Resources (destroyed)
+
+| Resource | Type | Name | Notes |
+|----------|------|------|-------|
+| Resource Group | Resource Group | `patching-system-rg` | Created in `centralus`; deleted after testing |
+| VM | Compute | `patch-test-linux` | Ubuntu 22.04, Standard_D2s_v3; Azure VM Agent verified Ready |
+| VM | Compute | `patch-test-win` | Windows Server 2022, Standard_D2s_v3; Azure VM Agent verified Ready |
