@@ -6,6 +6,19 @@
 #
 # Keeps Scan and Install as separate workflows so a compliance check
 # never accidentally installs packages on production machines.
+#
+# Step 1 — Terraform (prepare):
+#   Ensures patching infrastructure is in place (patch baselines, maintenance
+#   windows, Azure maintenance configs, GCP patch deployments). Idempotent —
+#   safe to run against an already-configured environment.
+#
+# Step 2 — Install:
+#   Triggers the actual package installation on each cloud's native patching
+#   engine and waits for completion.
+#
+# Step 3 — Compliance check:
+#   Runs the compliance report and fails the job if any VM is still
+#   non-compliant after patching.
 
 name: Apply Patches
 
@@ -48,27 +61,51 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── Auth (all three clouds, unconditional — Terraform needs all providers) ─
       - uses: aws-actions/configure-aws-credentials@v4
-        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'aws' }}
         with:
           role-to-assume: arn:aws:iam::089523922997:role/github-actions-golden-image
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: azure/login@v2
-        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'azure' }}
         with:
           client-id:       aca1b62d-9868-4f66-956f-cd639c5515dc
           tenant-id:       551ebe7c-477d-4607-b9a6-101ee365e775
           subscription-id: ${{ env.AZURE_SUB }}
 
       - uses: google-github-actions/auth@v2
-        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'gcp' }}
         with:
           workload_identity_provider: projects/718362285643/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: golden-image-sa@learn-image-project.iam.gserviceaccount.com
 
       - uses: google-github-actions/setup-gcloud@v2
-        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'gcp' }}
+
+      # ── Terraform: prepare patching infrastructure ─────────────────────────────
+      - name: Ensure Terraform state bucket exists
+        run: |
+          aws s3api create-bucket \
+            --bucket patching-system-tfstate-089523922997 \
+            --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+          aws s3api put-bucket-versioning \
+            --bucket patching-system-tfstate-089523922997 \
+            --versioning-configuration Status=Enabled 2>/dev/null || true
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      - name: Terraform init
+        working-directory: terraform/patching
+        run: terraform init
+
+      - name: Terraform apply — configure patching infrastructure
+        working-directory: terraform/patching
+        env:
+          ARM_USE_OIDC:        "true"
+          ARM_CLIENT_ID:       aca1b62d-9868-4f66-956f-cd639c5515dc
+          ARM_TENANT_ID:       551ebe7c-477d-4607-b9a6-101ee365e775
+          ARM_SUBSCRIPTION_ID: ${{ env.AZURE_SUB }}
+        run: terraform apply -auto-approve
 
       # ── AWS ────────────────────────────────────────────────────────────────
       - name: AWS — install patches via SSM

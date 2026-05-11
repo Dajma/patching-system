@@ -194,16 +194,6 @@ EOF
   az vm wait --created --resource-group "$RESOURCE_GROUP" \
     --name "$AZURE_WINDOWS_NAME" --subscription "$AZURE_SUBSCRIPTION_ID"
   ok "Azure VMs running"
-
-  log "Enabling periodic assessment on Azure VMs..."
-  for VM in "$AZURE_LINUX_NAME" "$AZURE_WINDOWS_NAME"; do
-    az vm assess-patches \
-      --resource-group "$RESOURCE_GROUP" \
-      --name "$VM" \
-      --subscription "$AZURE_SUBSCRIPTION_ID" \
-      --output none 2>/dev/null || true
-  done
-  ok "Azure patch assessment triggered"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -212,20 +202,10 @@ fi
 #           n1-standard-1 (1 vCPU, 3.75 GB) — cheapest Windows-capable: ~$0.035/hr
 # Linux:    Debian 12 (OS Config Agent pre-installed on all official GCE images)
 # Windows:  Windows Server 2022 (OS Config Agent included)
-# Auth:     Compute service account with osconfig.patchJobExecutor role
+# Note:     OS Config API enablement and project metadata are handled by Terraform
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$RUN_GCP" == "true" ]]; then
   log "=== GCP: Creating VMs ==="
-
-  log "Enabling GCP APIs (osconfig, compute)..."
-  gcloud services enable osconfig.googleapis.com compute.googleapis.com \
-    --project "$GCP_PROJECT" --quiet
-  ok "GCP APIs enabled"
-
-  gcloud compute project-info add-metadata \
-    --metadata enable-osconfig=true \
-    --project "$GCP_PROJECT" --quiet
-  ok "OS Config enabled project-wide"
 
   GCP_LINUX_NAME="${PREFIX}-linux"
   gcloud compute instances create "$GCP_LINUX_NAME" \
