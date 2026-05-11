@@ -60,7 +60,7 @@ if [[ "$RUN_AWS" == "true" && -n "${AWS_LINUX_ID:-}" ]]; then
   aws ec2 terminate-instances \
     --instance-ids "$AWS_LINUX_ID" "$AWS_WINDOWS_ID" \
     --region "$AWS_REGION" \
-    --output none
+    > /dev/null
   ok "Termination initiated: $AWS_LINUX_ID, $AWS_WINDOWS_ID"
 
   log "Waiting for instances to terminate..."
@@ -68,6 +68,16 @@ if [[ "$RUN_AWS" == "true" && -n "${AWS_LINUX_ID:-}" ]]; then
     --instance-ids "$AWS_LINUX_ID" "$AWS_WINDOWS_ID" \
     --region "$AWS_REGION"
   ok "Instances terminated"
+
+  # Release Elastic IPs if any were allocated
+  for EIP_VAR in AWS_EIP_LINUX AWS_EIP_WINDOWS; do
+    EIP_ID="${!EIP_VAR:-}"
+    if [[ -n "$EIP_ID" ]]; then
+      aws ec2 release-address --allocation-id "$EIP_ID" --region "$AWS_REGION" 2>/dev/null \
+        && ok "Elastic IP released: $EIP_ID" \
+        || warn "EIP $EIP_ID not released (may already be gone)"
+    fi
+  done
 
   # Delete security group (after instances terminate)
   if [[ -n "${AWS_SG_ID:-}" ]]; then
@@ -104,7 +114,7 @@ if [[ "$RUN_AZURE" == "true" && -n "${AZURE_RG:-}" ]]; then
     --subscription "$AZURE_SUBSCRIPTION_ID" \
     --yes \
     --no-wait \
-    --output none
+    > /dev/null
   ok "Azure resource group deletion initiated: $AZURE_RG (runs async in background)"
   log "Note: Azure RG deletion takes 3-10 minutes. Check portal to confirm completion."
 fi
