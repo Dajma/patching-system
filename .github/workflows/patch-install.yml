@@ -178,9 +178,8 @@ jobs:
       - name: Run compliance report
         if: always()
         run: |
-          python3 scripts/compliance-report.py 2>&1 | tee /tmp/report.txt || true
-          python3 scripts/compliance-report.py --json 2>/dev/null > /tmp/report.json \
-            || echo "[]" > /tmp/report.json
+          python3 scripts/compliance-report.py | tee /tmp/report.txt || true
+          python3 scripts/compliance-report.py --json > /tmp/report.json || echo "[]" > /tmp/report.json
 
       - name: Post to job summary
         if: always()

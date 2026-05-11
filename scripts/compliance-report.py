@@ -242,23 +242,27 @@ def main():
     run_azure = run_all or args.azure
     run_gcp   = run_all or args.gcp
 
-    print("☁️  Multi-Cloud Patch Compliance Report")
-    print('=' * 40)
-    print(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    print()
+    # In --json mode all human-readable output goes to stderr so stdout is
+    # pure JSON (safe to redirect to a file or pipe to jq).
+    out = sys.stderr if args.json else sys.stdout
+
+    print("☁️  Multi-Cloud Patch Compliance Report", file=out)
+    print('=' * 40, file=out)
+    print(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC", file=out)
+    print(file=out)
 
     rows = []
     if run_aws:
-        print(f"🔍 Gathering AWS data ({args.region})...")
+        print(f"🔍 Gathering AWS data ({args.region})...", file=out)
         rows += gather_aws(args.region)
     if run_azure:
-        print(f"🔍 Gathering Azure data ({args.resource_group})...")
+        print(f"🔍 Gathering Azure data ({args.resource_group})...", file=out)
         rows += gather_azure(AZURE_SUB, args.resource_group)
     if run_gcp:
-        print(f"🔍 Gathering GCP data ({args.project})...")
+        print(f"🔍 Gathering GCP data ({args.project})...", file=out)
         rows += gather_gcp(args.project, args.zone)
 
-    print()
+    print(file=out)
 
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -269,14 +273,14 @@ def main():
         1 for r in rows
         if any(x in r['status'].upper() for x in ('NON_COMPLIANT', 'FAILED', 'ERROR'))
     )
-    print()
+    print(file=out)
     if non_compliant:
-        print(f"{RED}⚠️  {non_compliant} non-compliant/failed VM(s) found{NC}")
+        print(f"{RED}⚠️  {non_compliant} non-compliant/failed VM(s) found{NC}", file=out)
         sys.exit(1)
     elif not rows:
-        print(f"{YELLOW}⚠️  No VMs found — are test VMs running?{NC}")
+        print(f"{YELLOW}⚠️  No VMs found — are test VMs running?{NC}", file=out)
     else:
-        print(f"{GREEN}✅ All scanned VMs are compliant{NC}")
+        print(f"{GREEN}✅ All scanned VMs are compliant{NC}", file=out)
 
 
 if __name__ == '__main__':
