@@ -20,9 +20,10 @@ Enterprise-grade automated patching for Windows and Linux VMs across **AWS**, **
 12. [Viewing Resources in Cloud Consoles](#12-viewing-resources-in-cloud-consoles)
 13. [Checking Patch Compliance in the Console](#13-checking-patch-compliance-in-the-console)
 14. [Creating the Patching Solution via the Console](#14-creating-the-patching-solution-via-the-console)
-15. [Project Structure](#15-project-structure)
-16. [Local Testing Scripts](#16-local-testing-scripts)
-17. [Quick Start](#17-quick-start)
+15. [Interview Summary — How I Built This](#15-interview-summary--how-i-built-this)
+16. [Project Structure](#16-project-structure)
+17. [Local Testing Scripts](#17-local-testing-scripts)
+18. [Quick Start](#18-quick-start)
 
 ---
 
@@ -773,7 +774,110 @@ These steps reproduce everything this project does — entirely through cloud co
 
 ---
 
-## 15. Project Structure
+## 15. Interview Summary — How I Built This
+
+> **Use this section to answer:** *"Tell me how you implemented a patching solution across AWS, Azure, and GCP for mutable infrastructure."*
+
+---
+
+### The Problem
+
+In a multi-cloud environment with long-lived (mutable) VMs, you need a reliable way to keep Windows and Linux machines patched against CVEs without taking them offline unexpectedly, without storing cloud credentials in CI/CD, and without writing different tooling per cloud.
+
+---
+
+### Approach: Native Cloud Tools, Unified Pipeline
+
+Rather than deploying a third-party agent like Ansible or Puppet, I used each cloud's **native patch management service** — which is already installed on every VM by default — and unified the visibility and triggering layer through a single GitHub Actions pipeline:
+
+| Cloud | Patch Engine | Scan mechanism | Install mechanism |
+|-------|-------------|----------------|-------------------|
+| AWS | SSM Patch Manager | `AWS-RunPatchBaseline` (Scan) | `AWS-RunPatchBaseline` (Install) |
+| Azure | Azure Update Manager | `az vm assess-patches` | `az vm install-patches` |
+| GCP | OS Config / VM Manager | patch job `--dry-run` | patch job (live) |
+
+This means zero additional agents, zero additional attack surface, and full integration with each cloud's existing compliance and audit tooling.
+
+---
+
+### Implementation Walkthrough
+
+**1. VM prerequisites**
+
+Each VM needs one thing: a way for the cloud control plane to talk to it.
+
+- **AWS** — IAM instance profile with `AmazonSSMManagedInstanceCore`. The SSM Agent (pre-installed on Amazon Linux 2 and Windows Server AMIs) opens an outbound HTTPS tunnel to SSM, so no inbound ports are required.
+- **Azure** — Guest Agent (built into every Azure VM) + the `WindowsPatches` / `LinuxPatches` VM extension enabled by toggling *Periodic assessment* on in Update Manager.
+- **GCP** — OS Config Agent (pre-installed on GCP images) + `osconfig` API enabled on the project. The agent polls the OS Config service over outbound HTTPS.
+
+**2. Patch baselines**
+
+I configured each cloud's patch filter to only auto-approve **Critical** and **Security** patches with at least a 7-day release lag (gives time for early adopters to surface regressions):
+
+- AWS: custom patch baseline via Patch Manager, associated to the `AWS-Default-PatchBaseline` Patch Group.
+- Azure: classification filter `Critical, Security` passed at install time via `--classifications-to-include`.
+- GCP: patch config targeting `YUM_CRITICAL` / `APT_DIST_UPGRADE` equivalents; severity filter applied at job creation.
+
+**3. GitHub Actions pipeline (OIDC, no stored secrets)**
+
+The automation layer is a two-job GitHub Actions workflow:
+
+```
+patch-scan  ──→  compliance-report
+```
+
+- **patch-scan** — triggers an assessment on all three clouds in parallel (SSM send-command, az vm assess-patches, GCP dry-run patch job), then waits up to 10 minutes for results to settle.
+- **compliance-report** — runs a Python script that queries all three clouds' APIs, aggregates results into a single table, posts it to the GitHub Actions job summary, and exits non-zero if any VM is non-compliant (triggering a GitHub notification email).
+
+Authentication uses **OIDC federation** — no AWS access keys, no Azure client secrets, no GCP service account JSON file are stored anywhere:
+
+- AWS: IAM role with a trust policy that allows `sts:AssumeRoleWithWebIdentity` for `repo:Dajma/patching-system:*`
+- Azure: App registration with a federated identity credential bound to `repo:Dajma/patching-system:ref:refs/heads/main`
+- GCP: Workload Identity Pool with a GitHub OIDC provider, mapped to a service account via attribute conditions
+
+**4. Patch installation (separate workflow)**
+
+Installation is a separate `workflow_dispatch`-only workflow (`patch-install.yml`) — it cannot run on a schedule and cannot be accidentally triggered by a PR. This separation is intentional: a compliance *scan* should never implicitly install packages on production machines. A human must explicitly trigger the install, choose which cloud, and choose whether to allow reboots.
+
+**5. Compliance aggregation script**
+
+`scripts/compliance-report.py` is a CLI tool that works both locally and in CI:
+
+```bash
+python3 scripts/compliance-report.py          # human-readable table
+python3 scripts/compliance-report.py --json   # machine-readable JSON (stdout only)
+python3 scripts/compliance-report.py --aws    # single cloud
+```
+
+It queries each cloud's patch state API, normalises the output into a common schema (`cloud`, `vm`, `os`, `status`, `missing`, `checked`), and prints a colour-coded table. The `--json` flag sends all human-readable output to stderr so stdout is pure JSON — safe to redirect to a file or pipe to `jq` without stripping header lines.
+
+---
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Native agents only | No third-party tool sprawl; agents already run on every VM |
+| OIDC, no stored secrets | Rotating leaked credentials is expensive; short-lived tokens eliminate the risk |
+| Scan and install are separate workflows | Prevents accidental production changes; install requires explicit human approval |
+| 7-day patch lag | Balances security with stability — catches regressions before fleet-wide rollout |
+| Compliance script exits non-zero on failure | Turns GitHub's notification email into a free alerting channel |
+| Python stdlib only | No pip install step in CI; the script runs anywhere Python 3 is present |
+| `--json` to stderr/stdout split | Makes the script composable — output is safe to pipe or redirect without post-processing |
+
+---
+
+### What I Would Add in Production
+
+- **Maintenance windows** — restrict installs to a pre-approved change window (AWS: Maintenance Windows; Azure: Update Manager schedules; GCP: patch deployment schedule).
+- **Canary rings** — patch a small percentage of the fleet first, wait 24 h, then proceed to the remainder.
+- **SNS / PagerDuty integration** — route the non-compliant exit code to an on-call alert rather than relying on email.
+- **Patch rollback runbook** — for kernel updates that break an application, document the tested rollback path (AMI snapshot restore on AWS, OS disk swap on Azure, snapshot restore on GCP).
+- **CMDB sync** — write compliance results to a CMDB (ServiceNow or similar) after each scan so auditors have a queryable history without reading GitHub logs.
+
+---
+
+## 16. Project Structure
 
 ```
 patching-system/
@@ -848,7 +952,7 @@ patching-system/
 
 ---
 
-## 14. Local Testing Scripts
+## 17. Local Testing Scripts
 
 After creating test VMs with `create-vms.sh`, use these scripts to manually verify that the patching infrastructure works end-to-end before relying on scheduled maintenance windows.
 
@@ -961,7 +1065,7 @@ GCP     patch-test-linux       Linux    SUCCEEDED      0        2026-05-10 14:10
 4. If healthy: patch remaining 95%
 
 ---
-## 15. Quick Start
+## 18. Quick Start
 
 ### Phase 1 — Create Test VMs
 ```bash
