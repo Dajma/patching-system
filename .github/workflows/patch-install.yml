@@ -1,0 +1,212 @@
+# patch-install.yml
+#
+# On-demand patch installation — manual trigger only.
+# Use this after Patch Tuesday to apply approved patches, or for
+# emergency out-of-band patching.
+#
+# Keeps Scan and Install as separate workflows so a compliance check
+# never accidentally installs packages on production machines.
+
+name: Apply Patches
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: "Which cloud to patch"
+        required: true
+        default: all
+        type: choice
+        options: [all, aws, azure, gcp]
+      reboot:
+        description: "Reboot VMs if required by patches?"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+concurrency:
+  group: patch-install
+  cancel-in-progress: false
+
+env:
+  AWS_REGION:  us-east-1
+  GCP_PROJECT: learn-image-project
+  GCP_ZONE:    us-central1-a
+  AZURE_RG:    patching-system-rg
+  AZURE_SUB:   2f791c46-1726-4a0c-94e8-48314ac8f1b4
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  apply-patches:
+    name: "Apply Patches (${{ github.event.inputs.cloud }}, reboot=${{ github.event.inputs.reboot }})"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'aws' }}
+        with:
+          role-to-assume: arn:aws:iam::089523922997:role/github-actions-golden-image
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: azure/login@v2
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'azure' }}
+        with:
+          client-id:       aca1b62d-9868-4f66-956f-cd639c5515dc
+          tenant-id:       551ebe7c-477d-4607-b9a6-101ee365e775
+          subscription-id: ${{ env.AZURE_SUB }}
+
+      - uses: google-github-actions/auth@v2
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'gcp' }}
+        with:
+          workload_identity_provider: projects/718362285643/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: golden-image-sa@learn-image-project.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'gcp' }}
+
+      # ── AWS ────────────────────────────────────────────────────────────────
+      - name: AWS — install patches via SSM
+        id: aws-patch
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'aws' }}
+        run: |
+          REBOOT_OPT="NoReboot"
+          [[ "${{ github.event.inputs.reboot }}" == "true" ]] && REBOOT_OPT="RebootIfNeeded"
+
+          CMD_ID=$(aws ssm send-command \
+            --targets "Key=tag:Project,Values=patching-system" \
+            --document-name AWS-RunPatchBaseline \
+            --parameters "{\"Operation\":[\"Install\"],\"RebootOption\":[\"$REBOOT_OPT\"]}" \
+            --comment "Patch install — ${{ github.run_id }}" \
+            --timeout-seconds 3600 \
+            --region "${{ env.AWS_REGION }}" \
+            --query "Command.CommandId" --output text 2>/dev/null || echo "")
+          echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "AWS patch install command: ${CMD_ID:-no targets found}"
+
+      # ── Azure ──────────────────────────────────────────────────────────────
+      - name: Azure — install patches via Update Manager
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'azure' }}
+        run: |
+          REBOOT_OPT="NeverReboot"
+          [[ "${{ github.event.inputs.reboot }}" == "true" ]] && REBOOT_OPT="IfRequired"
+
+          VMS=$(az vm list \
+            --resource-group "${{ env.AZURE_RG }}" \
+            --query "[?tags.Project=='patching-system'].name" \
+            --output tsv 2>/dev/null || echo "")
+
+          if [[ -z "$VMS" ]]; then
+            echo "No project VMs found in ${{ env.AZURE_RG }}"
+          else
+            while IFS= read -r VM; do
+              echo "Installing patches on $VM (reboot=$REBOOT_OPT)..."
+              az vm install-patches \
+                --resource-group "${{ env.AZURE_RG }}" \
+                --name "$VM" \
+                --maximum-duration PT2H \
+                --reboot-setting "$REBOOT_OPT" \
+                --classifications-to-include-win Critical Security \
+                --classifications-to-include-linux Critical Security \
+                --no-wait --output none 2>/dev/null \
+                && echo "  $VM: patch install initiated" \
+                || echo "  $VM: install-patches not available, skipping"
+            done <<< "$VMS"
+          fi
+
+      # ── GCP ────────────────────────────────────────────────────────────────
+      - name: GCP — install patches via OS Config
+        id: gcp-patch
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'gcp' }}
+        run: |
+          REBOOT_OPT="NEVER"
+          [[ "${{ github.event.inputs.reboot }}" == "true" ]] && REBOOT_OPT="DEFAULT"
+
+          JOB=$(gcloud compute os-config patch-jobs execute \
+            --project="${{ env.GCP_PROJECT }}" \
+            --instance-filter-label-key=project \
+            --instance-filter-label-values=patching-system \
+            --reboot-config="$REBOOT_OPT" \
+            --timeout=3600s \
+            --format="value(name)" 2>/dev/null || echo "")
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "GCP patch job: ${JOB:-no instances found}"
+
+      # ── Wait ───────────────────────────────────────────────────────────────
+      - name: Wait — AWS (up to 60 min)
+        if: ${{ steps.aws-patch.outputs.cmd_id != '' }}
+        run: |
+          CMD_ID="${{ steps.aws-patch.outputs.cmd_id }}"
+          for i in $(seq 1 90); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" \
+              --query "CommandInvocations[].Status" \
+              --output text --region "${{ env.AWS_REGION }}" 2>/dev/null || echo Pending)
+            echo "  [$i/90] $STATUS"
+            echo "$STATUS" | grep -qvE "InProgress|Pending|Delayed" && break
+            [[ "$i" -eq 90 ]] && echo "WARNING: timed out waiting for AWS patch install"
+            sleep 40
+          done
+          aws ssm list-command-invocations \
+            --command-id "$CMD_ID" \
+            --query "CommandInvocations[].{Instance:InstanceId,Status:Status,Details:StatusDetails}" \
+            --output table --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+
+      - name: Wait — GCP (up to 60 min)
+        if: ${{ steps.gcp-patch.outputs.job != '' }}
+        run: |
+          JOB="${{ steps.gcp-patch.outputs.job }}"
+          for i in $(seq 1 90); do
+            STATE=$(gcloud compute os-config patch-jobs describe "$JOB" \
+              --project="${{ env.GCP_PROJECT }}" \
+              --format="value(state)" 2>/dev/null || echo UNKNOWN)
+            echo "  [$i/90] $STATE"
+            [[ "$STATE" =~ ^(SUCCEEDED|COMPLETED_WITH_ERRORS|FAILED)$ ]] && break
+            [[ "$i" -eq 90 ]] && echo "WARNING: timed out waiting for GCP patch job"
+            sleep 40
+          done
+          gcloud compute os-config patch-jobs list-instance-details "$JOB" \
+            --project="${{ env.GCP_PROJECT }}" \
+            --format="table(name,state,failureReason)" 2>/dev/null || true
+
+      # ── Post-install compliance check ──────────────────────────────────────
+      - name: Run compliance report
+        if: always()
+        run: |
+          python3 scripts/compliance-report.py 2>&1 | tee /tmp/report.txt || true
+          python3 scripts/compliance-report.py --json 2>/dev/null > /tmp/report.json \
+            || echo "[]" > /tmp/report.json
+
+      - name: Post to job summary
+        if: always()
+        run: |
+          {
+            echo "## ☁️ Post-Patch Compliance Report"
+            echo ""
+            echo "**Cloud:** \`${{ github.event.inputs.cloud }}\` · **Reboot:** \`${{ github.event.inputs.reboot }}\`"
+            echo ""
+            echo "\`\`\`"
+            cat /tmp/report.txt
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if non-compliant after patching
+        run: |
+          python3 - << 'EOF'
+          import json, sys
+          with open("/tmp/report.json") as f:
+              rows = json.load(f)
+          bad = [r for r in rows
+                 if any(x in r["status"].upper() for x in ("NON_COMPLIANT", "FAILED", "ERROR"))]
+          if bad:
+              print(f"FAIL: {len(bad)} VM(s) still non-compliant after patching:")
+              for r in bad:
+                  print(f"  {r['cloud']} / {r['vm']} — {r['status']} ({r['missing']} missing)")
+              sys.exit(1)
+          print(f"OK: all {len(rows)} VMs compliant after patching")
+          EOF

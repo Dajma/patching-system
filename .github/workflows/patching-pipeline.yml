@@ -1,4 +1,11 @@
-# Multi-cloud VM patching pipeline
+# patching-pipeline.yml
+#
+# Scheduled compliance pipeline — runs daily, assumes VMs already exist.
+# Mirrors real-world practice: infrastructure is long-lived, the pipeline
+# owns patch assessment and compliance reporting, not VM lifecycle.
+#
+# Schedule: daily at 06:00 UTC (adjust to your patch window)
+# Manual:   workflow_dispatch (run on demand, e.g. after Patch Tuesday)
 #
 # Auth: OIDC — no long-lived credentials stored as secrets.
 #   AWS:   role  arn:aws:iam::089523922997:role/github-actions-golden-image
@@ -6,25 +13,27 @@
 #   GCP:   WIF   projects/718362285643/…/github-pool/providers/github-provider
 #
 # Jobs:
-#   1 · Create Test VMs  — create-vms.sh (Azure → GCP → AWS), cert fix, agent verify
-#   2 · Patch Scan       — SSM scan, az assess-patches, GCP dry-run, wait for completion
-#   3 · Compliance Report— compliance-report.py → Actions summary; fail if non-compliant
-#   4 · Cleanup          — destroy-vms.sh --force (always runs)
+#   1 · Patch Scan    — trigger assessments on all three clouds, wait for completion
+#   2 · Compliance    — run compliance-report.py, post table to job summary,
+#                       exit 1 if any VM is non-compliant (triggers alert email)
 
-name: Patching System CI/CD
+name: Patching Pipeline
 
 on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "README.md"
+    inputs:
+      cloud:
+        description: "Which cloud(s) to scan"
+        required: false
+        default: all
+        type: choice
+        options: [all, aws, azure, gcp]
 
-# Never cancel mid-flight — test VMs may already be up
 concurrency:
   group: patching-pipeline
-  cancel-in-progress: false
+  cancel-in-progress: false   # never interrupt a running scan
 
 env:
   AWS_REGION:  us-east-1
@@ -33,160 +42,93 @@ env:
   AZURE_RG:    patching-system-rg
   AZURE_SUB:   2f791c46-1726-4a0c-94e8-48314ac8f1b4
 
-# OIDC requires id-token: write
 permissions:
   id-token: write
   contents: read
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Reusable auth snippet — referenced in each job via a composite step would be
-# ideal, but GitHub doesn't support inline composites; we repeat the three
-# login steps per job instead (they're fast: ~5 s total).
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ── 1 · Patch Scan ────────────────────────────────────────────────────────────
 jobs:
-
-# ── 1 · Create Test VMs ───────────────────────────────────────────────────────
-  create-vms:
-    name: "1 · Create Test VMs"
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::089523922997:role/github-actions-golden-image
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: azure/login@v2
-        with:
-          client-id:       aca1b62d-9868-4f66-956f-cd639c5515dc
-          tenant-id:       551ebe7c-477d-4607-b9a6-101ee365e775
-          subscription-id: ${{ env.AZURE_SUB }}
-
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: projects/718362285643/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-          service_account: golden-image-sa@learn-image-project.iam.gserviceaccount.com
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Create VMs (Azure → GCP → AWS)
-        env:
-          AZURE_SUBSCRIPTION_ID: ${{ env.AZURE_SUB }}
-        run: bash scripts/create-vms.sh
-
-      # Fresh Windows AMIs ship with stale root certificates; the Windows Update
-      # API (WUApiLib) fails with 0x80072F8F (TLS handshake) until they're
-      # refreshed. Download the AuthRoot CTL over plain HTTP to break the
-      # chicken-and-egg, then reboot so the update takes effect.
-      - name: AWS Windows — refresh root certificates
-        run: |
-          source scripts/.vm-state.env
-          CMD_ID=$(aws ssm send-command \
-            --instance-ids "$AWS_WINDOWS_ID" \
-            --document-name AWS-RunPowerShellScript \
-            --parameters 'commands=[
-              "$ProgressPreference=\"SilentlyContinue\"",
-              "(New-Object System.Net.WebClient).DownloadFile(\"http://ctldl.windowsupdate.com/msdownload/update/v3/static/trustedr/en/authrootstl.cab\",\"C:\\Windows\\Temp\\roots.cab\")",
-              "if (Test-Path C:\\Windows\\Temp\\roots.cab) { expand.exe -F:* C:\\Windows\\Temp\\roots.cab C:\\Windows\\Temp\\ | Out-Null; Get-ChildItem C:\\Windows\\Temp\\*.sst | ForEach-Object { certutil -addstore -f root $_.FullName | Out-Null }; Write-Host \"Root certs updated\" } else { Write-Host \"Download failed — skipping\" }",
-              "Restart-Computer -Force"
-            ]' \
-            --region "${{ env.AWS_REGION }}" \
-            --query "Command.CommandId" --output text)
-          echo "Cert-fix command: $CMD_ID — waiting for reboot to complete..."
-          sleep 60
-          for i in $(seq 1 24); do
-            PING=$(aws ssm describe-instance-information \
-              --filters "Key=InstanceIds,Values=$AWS_WINDOWS_ID" \
-              --region "${{ env.AWS_REGION }}" \
-              --query "InstanceInformationList[0].PingStatus" --output text 2>/dev/null || echo Offline)
-            echo "  [$i/24] SSM ping: $PING"
-            [[ "$PING" == "Online" ]] && echo "Windows SSM back online" && break
-            sleep 15
-          done
-        continue-on-error: true   # don't block the pipeline if the AMI already has fresh certs
-
-      - name: Verify patch agents online
-        run: bash scripts/verify-agents.sh
-
-      - name: Upload VM state
-        uses: actions/upload-artifact@v4
-        with:
-          name: vm-state
-          path: scripts/.vm-state.env
-          retention-days: 1
-
-# ── 2 · Patch Scan ────────────────────────────────────────────────────────────
   patch-scan:
-    name: "2 · Patch Scan"
+    name: "1 · Patch Scan"
     runs-on: ubuntu-latest
-    needs: create-vms
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: aws-actions/configure-aws-credentials@v4
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'aws' || github.event_name == 'schedule' }}
         with:
           role-to-assume: arn:aws:iam::089523922997:role/github-actions-golden-image
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: azure/login@v2
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'azure' || github.event_name == 'schedule' }}
         with:
           client-id:       aca1b62d-9868-4f66-956f-cd639c5515dc
           tenant-id:       551ebe7c-477d-4607-b9a6-101ee365e775
           subscription-id: ${{ env.AZURE_SUB }}
 
       - uses: google-github-actions/auth@v2
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'gcp' || github.event_name == 'schedule' }}
         with:
           workload_identity_provider: projects/718362285643/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: golden-image-sa@learn-image-project.iam.gserviceaccount.com
 
       - uses: google-github-actions/setup-gcloud@v2
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'gcp' || github.event_name == 'schedule' }}
 
-      - name: Download VM state
-        uses: actions/download-artifact@v4
-        with:
-          name: vm-state
-          path: scripts/
-
-      - name: AWS — SSM patch scan
+      # ── AWS ────────────────────────────────────────────────────────────────
+      - name: AWS — trigger SSM patch scan
         id: aws-scan
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'aws' || github.event_name == 'schedule' }}
         run: |
-          source scripts/.vm-state.env
           CMD_ID=$(aws ssm send-command \
-            --instance-ids "$AWS_LINUX_ID" "$AWS_WINDOWS_ID" \
+            --targets "Key=tag:Project,Values=patching-system" \
             --document-name AWS-RunPatchBaseline \
             --parameters '{"Operation":["Scan"]}' \
-            --comment "CI scan — ${{ github.run_id }}" \
+            --comment "Scheduled scan — ${{ github.run_id }}" \
             --region "${{ env.AWS_REGION }}" \
-            --query "Command.CommandId" --output text)
+            --query "Command.CommandId" --output text 2>/dev/null || echo "")
           echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
-          echo "AWS scan command: $CMD_ID"
+          echo "AWS SSM scan: ${CMD_ID:-no targets found}"
 
-      - name: Azure — assess patches (async)
+      # ── Azure ──────────────────────────────────────────────────────────────
+      - name: Azure — assess patches on all project VMs
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'azure' || github.event_name == 'schedule' }}
         run: |
-          for VM in patch-test-linux patch-test-win; do
-            echo "Assessing $VM..."
-            az vm assess-patches \
-              --resource-group "${{ env.AZURE_RG }}" \
-              --name "$VM" \
-              --no-wait --output none 2>/dev/null || true
-          done
+          VMS=$(az vm list \
+            --resource-group "${{ env.AZURE_RG }}" \
+            --query "[?tags.Project=='patching-system'].name" \
+            --output tsv 2>/dev/null || echo "")
+          if [[ -z "$VMS" ]]; then
+            echo "No project VMs found in ${{ env.AZURE_RG }}"
+          else
+            while IFS= read -r VM; do
+              echo "Assessing $VM..."
+              az vm assess-patches \
+                --resource-group "${{ env.AZURE_RG }}" \
+                --name "$VM" \
+                --no-wait --output none 2>/dev/null || true
+            done <<< "$VMS"
+          fi
 
+      # ── GCP ────────────────────────────────────────────────────────────────
       - name: GCP — dry-run patch scan
         id: gcp-scan
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'gcp' || github.event_name == 'schedule' }}
         run: |
           JOB=$(gcloud compute os-config patch-jobs execute \
             --project="${{ env.GCP_PROJECT }}" \
-            --instance-filter-all \
+            --instance-filter-label-key=project \
+            --instance-filter-label-values=patching-system \
             --dry-run \
-            --format="value(name)")
+            --format="value(name)" 2>/dev/null || echo "")
           echo "job=$JOB" >> "$GITHUB_OUTPUT"
-          echo "GCP patch job: $JOB"
+          echo "GCP patch job: ${JOB:-no instances found}"
 
+      # ── Wait ───────────────────────────────────────────────────────────────
       - name: Wait — AWS scan (up to 10 min)
+        if: ${{ steps.aws-scan.outputs.cmd_id != '' }}
         run: |
           CMD_ID="${{ steps.aws-scan.outputs.cmd_id }}"
           for i in $(seq 1 30); do
@@ -196,7 +138,7 @@ jobs:
               --output text --region "${{ env.AWS_REGION }}" 2>/dev/null || echo Pending)
             echo "  [$i/30] $STATUS"
             echo "$STATUS" | grep -qvE "InProgress|Pending|Delayed" && break
-            [[ "$i" -eq 30 ]] && echo "WARNING: scan timed out"
+            [[ "$i" -eq 30 ]] && echo "WARNING: scan timed out — continuing to report"
             sleep 20
           done
           aws ssm list-command-invocations \
@@ -205,6 +147,7 @@ jobs:
             --output table --region "${{ env.AWS_REGION }}" 2>/dev/null || true
 
       - name: Wait — GCP scan (up to 10 min)
+        if: ${{ steps.gcp-scan.outputs.job != '' }}
         run: |
           JOB="${{ steps.gcp-scan.outputs.job }}"
           for i in $(seq 1 30); do
@@ -213,13 +156,18 @@ jobs:
               --format="value(state)" 2>/dev/null || echo UNKNOWN)
             echo "  [$i/30] $STATE"
             [[ "$STATE" =~ ^(SUCCEEDED|COMPLETED_WITH_ERRORS|FAILED)$ ]] && break
-            [[ "$i" -eq 30 ]] && echo "WARNING: GCP scan timed out"
+            [[ "$i" -eq 30 ]] && echo "WARNING: GCP scan timed out — continuing to report"
             sleep 20
           done
 
-# ── 3 · Compliance Report ─────────────────────────────────────────────────────
+      # Azure assess-patches runs async; give it 2 min to populate instance view
+      - name: Wait — Azure assessment settle time
+        if: ${{ github.event.inputs.cloud == 'all' || github.event.inputs.cloud == 'azure' || github.event_name == 'schedule' }}
+        run: sleep 120
+
+# ── 2 · Compliance Report ─────────────────────────────────────────────────────
   compliance-report:
-    name: "3 · Compliance Report"
+    name: "2 · Compliance Report"
     runs-on: ubuntu-latest
     needs: patch-scan
 
@@ -255,9 +203,12 @@ jobs:
         run: |
           {
             echo "## ☁️ Patch Compliance Report"
-            echo '```'
+            echo ""
+            echo "\`\`\`"
             cat /tmp/report.txt
-            echo '```'
+            echo "\`\`\`"
+            echo ""
+            echo "_Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) · $(date -u '+%Y-%m-%d %H:%M UTC')_"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail if non-compliant
@@ -269,69 +220,12 @@ jobs:
           bad = [r for r in rows
                  if any(x in r["status"].upper() for x in ("NON_COMPLIANT", "FAILED", "ERROR"))]
           if bad:
-              print(f"FAIL: {len(bad)} non-compliant VM(s): {[r['vm'] for r in bad]}")
+              print(f"FAIL: {len(bad)} non-compliant VM(s):")
+              for r in bad:
+                  print(f"  {r['cloud']} / {r['vm']} — {r['status']} ({r['missing']} missing patches)")
+              sys.exit(1)
+          if not rows:
+              print("WARNING: no VMs found — are the test VMs running?")
               sys.exit(1)
           print(f"OK: all {len(rows)} VMs compliant")
           EOF
-
-# ── 4 · Cleanup (always runs) ─────────────────────────────────────────────────
-  cleanup:
-    name: "4 · Cleanup Test VMs"
-    runs-on: ubuntu-latest
-    needs: [create-vms, patch-scan, compliance-report]
-    if: always()
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download VM state
-        uses: actions/download-artifact@v4
-        with:
-          name: vm-state
-          path: scripts/
-        continue-on-error: true   # state won't exist if create-vms never ran
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::089523922997:role/github-actions-golden-image
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: azure/login@v2
-        with:
-          client-id:       aca1b62d-9868-4f66-956f-cd639c5515dc
-          tenant-id:       551ebe7c-477d-4607-b9a6-101ee365e775
-          subscription-id: ${{ env.AZURE_SUB }}
-
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: projects/718362285643/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-          service_account: golden-image-sa@learn-image-project.iam.gserviceaccount.com
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Destroy test VMs
-        env:
-          AZURE_SUBSCRIPTION_ID: ${{ env.AZURE_SUB }}
-        run: |
-          if [[ ! -f scripts/.vm-state.env ]]; then
-            echo "No state file — nothing to destroy"
-            exit 0
-          fi
-          bash scripts/destroy-vms.sh --force
-
-      - name: Confirm no running test VMs
-        run: |
-          echo "=== AWS ==="
-          aws ec2 describe-instances \
-            --filters "Name=tag:Project,Values=patching-system" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" \
-            --output text --region "${{ env.AWS_REGION }}" || echo "None"
-
-          echo "=== Azure ==="
-          az group exists --name "${{ env.AZURE_RG }}" --output tsv
-
-          echo "=== GCP ==="
-          gcloud compute instances list \
-            --project="${{ env.GCP_PROJECT }}" \
-            --filter="labels.project=patching-system" \
-            --format="table(name,status,zone)" 2>/dev/null || echo "None"
