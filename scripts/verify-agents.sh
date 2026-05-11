@@ -152,18 +152,20 @@ if [[ "$RUN_GCP" == "true" ]]; then
 
   GCP_VERIFIED=0
 
+  GCP_TOKEN=$(gcloud auth print-access-token 2>/dev/null)
+
   for INSTANCE in "$GCP_LINUX_NAME" "$GCP_WINDOWS_NAME"; do
     INSTANCE_READY=false
     for i in $(seq 1 24); do
-      INVENTORY=$(gcloud compute os-config inventories describe "$INSTANCE" \
-        --project "$GCP_PROJECT" \
-        --zone "$GCP_ZONE" \
-        --format json 2>/dev/null || echo "{}")
+      # Use REST API directly — gcloud compute os-config inventories has a known
+      # CLI quirk where it silently returns nothing even when the API has data.
+      OS_NAME=$(curl -s -H "Authorization: Bearer $GCP_TOKEN" \
+        "https://osconfig.googleapis.com/v1/projects/${GCP_PROJECT}/locations/${GCP_ZONE}/instances/${INSTANCE}/inventory" \
+        2>/dev/null | python3 -c \
+        "import json,sys; d=json.load(sys.stdin); print(d.get('osInfo',{}).get('longName',''))" \
+        2>/dev/null || true)
 
-      if [[ "$INVENTORY" != "{}" && -n "$INVENTORY" ]]; then
-        OS_NAME=$(echo "$INVENTORY" | python3 -c \
-          "import json,sys; d=json.load(sys.stdin); print(d.get('osInfo', {}).get('longName', 'unknown'))" \
-          2>/dev/null || echo "unknown")
+      if [[ -n "$OS_NAME" ]]; then
         ok "GCP OS Config Agent: $INSTANCE — reporting ($OS_NAME)"
         GCP_VERIFIED=$((GCP_VERIFIED + 1))
         INSTANCE_READY=true
@@ -174,7 +176,6 @@ if [[ "$RUN_GCP" == "true" ]]; then
 
       if [[ "$i" -eq 24 ]]; then
         warn "OS Config Agent not reporting for $INSTANCE after 8 minutes."
-        warn "  Check: gcloud compute os-config inventories describe $INSTANCE --project $GCP_PROJECT --zone $GCP_ZONE"
         warn "  Verify: VM metadata has enable-osconfig=true"
         warn "  Verify: project metadata has enable-osconfig=true"
         warn "  If using a non-standard image, build: packer/gcp/debian-osconfig.pkr.hcl"

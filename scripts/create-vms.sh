@@ -10,7 +10,7 @@ AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID:-2f791c46-1726-4a0c-94e8-48314ac8
 GCP_PROJECT="${GCP_PROJECT:-learn-image-project}"
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
-AZURE_REGION="${AZURE_REGION:-eastus}"
+AZURE_REGION="${AZURE_REGION:-centralus}"
 GCP_ZONE="${GCP_ZONE:-us-central1-a}"
 
 RESOURCE_GROUP="patching-system-rg"
@@ -30,7 +30,7 @@ warn() { echo "[$(date -u '+%H:%M:%S')] ⚠ $*" >&2; }
 die()  { echo "[$(date -u '+%H:%M:%S')] ✗ $*" >&2; exit 1; }
 
 usage() {
-  echo "Usage: $0 [--aws-only | --azure-only | --gcp-only] [--status] [--dry-run]"
+  echo "Usage: $0 [--aws-only | --azure-only | --gcp-only] [--no-aws | --no-azure | --no-gcp] [--status] [--dry-run]"
   exit 0
 }
 
@@ -43,6 +43,9 @@ for arg in "$@"; do
     --aws-only)   RUN_AZURE=false; RUN_GCP=false ;;
     --azure-only) RUN_AWS=false;   RUN_GCP=false ;;
     --gcp-only)   RUN_AWS=false;   RUN_AZURE=false ;;
+    --no-aws)     RUN_AWS=false ;;
+    --no-azure)   RUN_AZURE=false ;;
+    --no-gcp)     RUN_GCP=false ;;
     --dry-run)    DRY_RUN=true ;;
     --status)     STATUS_ONLY=true ;;
     --help|-h)    usage ;;
@@ -96,7 +99,9 @@ fi
 [[ "$DRY_RUN" == "true" ]] && log "DRY RUN — no resources will be created." && exit 0
 
 # ── State file init ───────────────────────────────────────────────────────────
-cat > "$STATE_FILE" <<EOF
+# Full run: fresh file. Partial run: preserve existing cloud entries.
+if [[ "$RUN_AWS" == "true" && "$RUN_AZURE" == "true" && "$RUN_GCP" == "true" ]]; then
+  cat > "$STATE_FILE" <<EOF
 # VM State — written by create-vms.sh on $(date -u)
 # Source this file to get resource IDs for destroy-vms.sh
 AZURE_SUBSCRIPTION_ID="$AZURE_SUBSCRIPTION_ID"
@@ -105,6 +110,17 @@ AWS_REGION="$AWS_REGION"
 AZURE_REGION="$AZURE_REGION"
 GCP_ZONE="$GCP_ZONE"
 EOF
+else
+  # Partial run — preserve existing state, just update the header timestamp
+  [[ -f "$STATE_FILE" ]] || cat > "$STATE_FILE" <<EOF
+# VM State — written by create-vms.sh on $(date -u)
+AZURE_SUBSCRIPTION_ID="$AZURE_SUBSCRIPTION_ID"
+GCP_PROJECT="$GCP_PROJECT"
+AWS_REGION="$AWS_REGION"
+AZURE_REGION="$AZURE_REGION"
+GCP_ZONE="$GCP_ZONE"
+EOF
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AWS
@@ -188,7 +204,6 @@ if [[ "$RUN_AWS" == "true" ]]; then
     --tag-specifications \
       "ResourceType=instance,Tags=[{Key=Name,Value=${PREFIX}-linux},{Key=Environment,Value=testing},{Key=Project,Value=patching-system},{Key=TTL,Value=24h},{Key=OS,Value=linux}]" \
     --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=1" \
-    --no-associate-public-ip-address \
     --query 'Instances[0].InstanceId' --output text --region "$AWS_REGION")
   ok "AWS Linux VM: $AWS_LINUX_ID"
 
@@ -206,7 +221,6 @@ if [[ "$RUN_AWS" == "true" ]]; then
     --tag-specifications \
       "ResourceType=instance,Tags=[{Key=Name,Value=${PREFIX}-windows},{Key=Environment,Value=testing},{Key=Project,Value=patching-system},{Key=TTL,Value=24h},{Key=OS,Value=windows}]" \
     --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=1" \
-    --no-associate-public-ip-address \
     --query 'Instances[0].InstanceId' --output text --region "$AWS_REGION")
   ok "AWS Windows VM: $AWS_WINDOWS_ID"
 
@@ -225,8 +239,8 @@ fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AZURE
-# VM type:  Standard_B1s (1 vCPU, 1 GB) — cheapest burstable Linux: ~$0.011/hr
-#           Standard_B2s (2 vCPU, 4 GB) — cheapest Windows that runs: ~$0.052/hr
+# VM type:  Standard_D2s_v3 (2 vCPU, 8 GB) — available in centralus: ~$0.096/hr
+#           Standard_D2s_v3 (2 vCPU, 8 GB) — same SKU for Windows
 # Linux:    Ubuntu 22.04 LTS (Azure Monitor Agent auto-enabled via policy)
 # Windows:  Windows Server 2022 Datacenter (Windows Update Agent built-in)
 # Auth:     System-assigned managed identity + Update Manager role
@@ -253,11 +267,11 @@ if [[ "$RUN_AZURE" == "true" ]]; then
     --resource-group "$RESOURCE_GROUP" \
     --name "$AZURE_LINUX_NAME" \
     --image Ubuntu2204 \
-    --size Standard_B1s \
+    --size Standard_D2s_v3 \
     --admin-username azureuser \
     --generate-ssh-keys \
     --assign-identity "[system]" \
-    --public-ip-sku Basic \
+    --public-ip-sku Standard \
     --tags $AZURE_TAGS OS=linux \
     --subscription "$AZURE_SUBSCRIPTION_ID" \
     --output none \
@@ -265,18 +279,18 @@ if [[ "$RUN_AZURE" == "true" ]]; then
   ok "Azure Linux VM creation started: $AZURE_LINUX_NAME"
 
   # ── Windows Server 2022 VM (Standard_B2s) ────────────────────────────────
-  AZURE_WINDOWS_NAME="${PREFIX}-windows"
+  AZURE_WINDOWS_NAME="${PREFIX}-win"
   AZURE_WIN_PASSWORD=$(openssl rand -base64 16 | tr -d '/+=' | head -c16)Aa1!
 
   az vm create \
     --resource-group "$RESOURCE_GROUP" \
     --name "$AZURE_WINDOWS_NAME" \
     --image Win2022Datacenter \
-    --size Standard_B2s \
+    --size Standard_D2s_v3 \
     --admin-username azureuser \
     --admin-password "$AZURE_WIN_PASSWORD" \
     --assign-identity "[system]" \
-    --public-ip-sku Basic \
+    --public-ip-sku Standard \
     --tags $AZURE_TAGS OS=windows \
     --subscription "$AZURE_SUBSCRIPTION_ID" \
     --output none \
@@ -340,7 +354,6 @@ if [[ "$RUN_GCP" == "true" ]]; then
     --machine-type e2-micro \
     --image-project debian-cloud \
     --image-family debian-12 \
-    --no-address \
     --labels "$GCP_LABELS,os=linux" \
     --metadata "enable-osconfig=true" \
     --scopes "https://www.googleapis.com/auth/cloud-platform" \
@@ -355,7 +368,6 @@ if [[ "$RUN_GCP" == "true" ]]; then
     --machine-type n1-standard-1 \
     --image-project windows-cloud \
     --image-family windows-2022 \
-    --no-address \
     --labels "$GCP_LABELS,os=windows" \
     --metadata "enable-osconfig=true,sysprep-specialize-script-ps1=Set-Service -Name 'google-osconfig-agent' -StartupType Automatic" \
     --scopes "https://www.googleapis.com/auth/cloud-platform" \
